@@ -10,7 +10,7 @@ from backtester import (
     run_backtest,
 )
 from engine import RuleState, WaveCandidate
-from pivots import Pivot
+from pivots import ActiveLeg, Pivot
 
 
 def market(highs, lows, closes):
@@ -42,6 +42,8 @@ def wave4_candidate(index):
         rule_states=(RuleState("partial_structure", True, "valid through Wave 4"),),
         invalidation_level=104.0,
         invalidation_side="below",
+        status="EntryReady",
+        as_of=index[4],
     )
 
 
@@ -156,6 +158,93 @@ def test_completed_wave_5_path_is_not_treated_as_fresh_wave_4_setup():
     )
 
     assert summary.total_trades == 0
+
+
+def test_forming_candidate_is_observed_but_never_traded():
+    frame = market(
+        [101, 111, 105, 121, 115, 116],
+        [99, 103, 103, 111, 112, 113],
+        [100, 110, 104, 120, 114, 115],
+    )
+    ready = wave4_candidate(frame.index)
+    forming = WaveCandidate(
+        pattern=ready.pattern,
+        direction=ready.direction,
+        pivots=ready.pivots[:4],
+        labels=("Start", "1", "2", "3"),
+        rule_states=ready.rule_states,
+        invalidation_level=ready.invalidation_level,
+        invalidation_side=ready.invalidation_side,
+        status="Forming",
+        active_leg=ActiveLeg(
+            frame.index[4], 112.0, "Low", 1.0, "down"
+        ),
+        forming_label="4",
+        as_of=frame.index[4],
+    )
+
+    summary = run_backtest(
+        frame,
+        [CandidateRanking(frame.index[4], forming, 95)],
+        minimum_confidence=70,
+    )
+
+    assert summary.total_trades == 0
+
+
+def test_causal_rankings_record_forming_revisions_once_and_entry_transition_once():
+    frame = market([121] * 7, [99] * 7, [110] * 7)
+    ready = wave4_candidate(frame.index)
+
+    def staged_ranker(prefix):
+        position = len(prefix) - 1
+        if position < 4:
+            return []
+        if position in {4, 5}:
+            active = ActiveLeg(
+                prefix.index[-1],
+                114.0 - position,
+                "Low",
+                1.0,
+                "down",
+            )
+            forming = WaveCandidate(
+                ready.pattern,
+                ready.direction,
+                ready.pivots[:4],
+                ("Start", "1", "2", "3"),
+                ready.rule_states,
+                ready.invalidation_level,
+                ready.invalidation_side,
+                status="Forming",
+                active_leg=active,
+                forming_label="4",
+                as_of=prefix.index[-1],
+            )
+            return [(forming, 75 + position)]
+        repeated_ready = WaveCandidate(
+            ready.pattern,
+            ready.direction,
+            ready.pivots,
+            ready.labels,
+            ready.rule_states,
+            ready.invalidation_level,
+            ready.invalidation_side,
+            status="EntryReady",
+            as_of=prefix.index[-1],
+        )
+        return [(repeated_ready, 90)]
+
+    rankings = build_causal_rankings(
+        frame, multiplier=2, ranker=staged_ranker
+    )
+
+    assert [item.candidate.status for item in rankings] == [
+        "Forming",
+        "Forming",
+        "EntryReady",
+    ]
+    assert rankings[-1].detected_at == frame.index[6]
 
 
 def test_open_trade_is_closed_at_end_of_data():

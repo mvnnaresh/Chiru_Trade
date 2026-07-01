@@ -7,8 +7,8 @@ from typing import Callable, Iterable, Mapping
 
 import pandas as pd
 
-from engine import WaveCandidate, build_candidates
-from pivots import extract_pivots
+from engine import WaveCandidate, build_candidates, find_provisional_candidates
+from pivots import extract_pivot_state
 from scoring import ConfidenceScore, score_candidates
 
 
@@ -86,19 +86,23 @@ def build_causal_rankings(
     _validate_ohlcv(ohlcv)
 
     def default_ranker(prefix: pd.DataFrame) -> Mapping[WaveCandidate, ConfidenceScore]:
-        pivots = extract_pivots(prefix, multiplier, atr_period=atr_period)
-        candidates = build_candidates(pivots)
+        state = extract_pivot_state(
+            prefix, multiplier, atr_period=atr_period
+        )
+        candidates = build_candidates(state.confirmed)
+        candidates.extend(find_provisional_candidates(state))
         return score_candidates(candidates, prefix, rsi_period=rsi_period)
 
     selected_ranker = ranker or default_ranker
-    seen: set[WaveCandidate] = set()
+    seen: set[tuple[object, ...]] = set()
     rankings: list[CandidateRanking] = []
     for position, timestamp in enumerate(ohlcv.index):
         prefix = ohlcv.iloc[: position + 1].copy()
         ranked = selected_ranker(prefix)
         entries = ranked.items() if isinstance(ranked, Mapping) else ranked
         for candidate, score_value in entries:
-            if candidate in seen:
+            observation_key = _candidate_observation_key(candidate)
+            if observation_key in seen:
                 continue
             score = (
                 score_value.total
@@ -107,7 +111,7 @@ def build_causal_rankings(
             )
             _assert_candidate_is_causal(candidate, timestamp)
             rankings.append(CandidateRanking(timestamp, candidate, score))
-            seen.add(candidate)
+            seen.add(observation_key)
     return tuple(rankings)
 
 
@@ -276,7 +280,34 @@ def _summary(ledger: tuple[Trade, ...]) -> BacktestSummary:
 
 
 def _is_tradeable_setup(candidate: WaveCandidate) -> bool:
-    return bool(candidate.labels) and candidate.labels[-1] in {"4", "B"}
+    return (
+        candidate.status == "EntryReady"
+        and bool(candidate.labels)
+        and candidate.labels[-1] in {"4", "B"}
+    )
+
+
+def _candidate_observation_key(candidate: WaveCandidate) -> tuple[object, ...]:
+    """Deduplicate stable stages while retaining forming-leg revisions."""
+    active_key: tuple[object, ...] | None = None
+    if candidate.status == "Forming" and candidate.active_leg is not None:
+        active_key = (
+            candidate.active_leg.timestamp,
+            candidate.active_leg.price,
+            candidate.active_leg.type,
+            candidate.active_leg.direction,
+        )
+    return (
+        candidate.pattern,
+        candidate.direction,
+        candidate.status,
+        candidate.labels,
+        tuple(
+            (pivot.timestamp, pivot.price, pivot.type)
+            for pivot in candidate.pivots
+        ),
+        active_key,
+    )
 
 
 def _assert_candidate_is_causal(
@@ -284,6 +315,13 @@ def _assert_candidate_is_causal(
 ) -> None:
     if candidate.pivots and candidate.pivots[-1].timestamp > detected_at:
         raise ValueError("candidate contains a pivot from after detected_at")
+    if candidate.as_of is not None and candidate.as_of > detected_at:
+        raise ValueError("candidate as_of is after detected_at")
+    if (
+        candidate.active_leg is not None
+        and candidate.active_leg.timestamp > detected_at
+    ):
+        raise ValueError("candidate active leg is from after detected_at")
 
 
 def _validate_ohlcv(ohlcv: pd.DataFrame) -> None:

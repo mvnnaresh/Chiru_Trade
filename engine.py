@@ -5,11 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from pivots import Pivot
+import pandas as pd
+
+from pivots import ActiveLeg, Pivot, PivotState
 
 Pattern = Literal["Impulse", "ZigZag", "Flat", "Triangle"]
 Direction = Literal["Bullish", "Bearish"]
 BreachSide = Literal["below", "above"]
+CandidateStatus = Literal["Forming", "EntryReady", "Completed", "Invalidated"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +35,10 @@ class WaveCandidate:
     rule_states: tuple[RuleState, ...]
     invalidation_level: float
     invalidation_side: BreachSide
+    status: CandidateStatus = "Completed"
+    active_leg: ActiveLeg | None = None
+    forming_label: Literal["4", "B"] | None = None
+    as_of: pd.Timestamp | None = None
 
     @property
     def labeled_waves(self) -> tuple[tuple[str, Pivot], ...]:
@@ -116,6 +123,230 @@ def build_candidates(
         include_zigzags=include_zigzags,
         include_flats=include_flats,
         include_triangles=include_triangles,
+    )
+
+
+def find_provisional_candidates(
+    state: PivotState,
+    *,
+    include_impulses: bool = True,
+    include_zigzags: bool = True,
+) -> list[WaveCandidate]:
+    """Return causal forming and entry-ready paths at the market edge.
+
+    Forming paths use ``state.active_leg`` without promoting it to a confirmed
+    pivot. Entry-ready paths terminate at a confirmed Wave 4/B and record the
+    snapshot's ``as_of`` detection time.
+    """
+    if not isinstance(state, PivotState):
+        raise TypeError("state must be a PivotState")
+    nodes = state.confirmed
+    _validate_pivots(nodes)
+    if nodes and state.as_of is not None and state.as_of < nodes[-1].timestamp:
+        raise ValueError("state as_of cannot precede the latest confirmed pivot")
+    if state.active_leg is not None:
+        if nodes and state.active_leg.timestamp <= nodes[-1].timestamp:
+            raise ValueError("active leg must follow the latest confirmed pivot")
+        if state.as_of is not None and state.active_leg.timestamp > state.as_of:
+            raise ValueError("active leg cannot occur after state as_of")
+    candidates: list[WaveCandidate] = []
+
+    if include_impulses:
+        if len(nodes) >= 4 and state.active_leg is not None:
+            forming_impulse = _evaluate_forming_impulse(
+                nodes[-4:], state.active_leg, state.as_of
+            )
+            if forming_impulse is not None:
+                candidates.append(forming_impulse)
+        if len(nodes) >= 5:
+            entry_impulse = _evaluate_entry_ready_impulse(
+                nodes[-5:], state.as_of
+            )
+            if entry_impulse is not None:
+                candidates.append(entry_impulse)
+
+    if include_zigzags:
+        if len(nodes) >= 2 and state.active_leg is not None:
+            forming_zigzag = _evaluate_forming_zigzag(
+                nodes[-2:], state.active_leg, state.as_of
+            )
+            if forming_zigzag is not None:
+                candidates.append(forming_zigzag)
+        if len(nodes) >= 3:
+            entry_zigzag = _evaluate_entry_ready_zigzag(
+                nodes[-3:], state.as_of
+            )
+            if entry_zigzag is not None:
+                candidates.append(entry_zigzag)
+
+    return candidates
+
+
+def _evaluate_forming_impulse(
+    pivots: tuple[Pivot, ...],
+    active_leg: ActiveLeg,
+    as_of: pd.Timestamp | None,
+) -> WaveCandidate | None:
+    if len(pivots) != 4:
+        raise ValueError("a forming Impulse requires Start and Waves 1-3")
+    _validate_pivots(pivots)
+    if not _alternates(pivots):
+        return None
+    bullish = pivots[0].type == "Low"
+    sign = 1.0 if bullish else -1.0
+    if active_leg.type != ("Low" if bullish else "High"):
+        return None
+    wave_1 = sign * (pivots[1].price - pivots[0].price)
+    wave_3 = sign * (pivots[3].price - pivots[2].price)
+    rule_1 = sign * (pivots[2].price - pivots[0].price) >= 0
+    rule_3 = sign * (active_leg.price - pivots[1].price) > 0
+    states = (
+        RuleState(
+            "wave_2_retracement",
+            rule_1 and wave_1 > 0,
+            "Wave 2 must not pass the origin of Wave 1",
+        ),
+        RuleState(
+            "wave_3_direction",
+            wave_3 > 0,
+            "Wave 3 must advance in the impulse direction",
+        ),
+        RuleState(
+            "forming_wave_4_no_overlap",
+            rule_3,
+            "Forming Wave 4 must remain outside Wave 1 territory",
+        ),
+    )
+    if not all(item.passed for item in states):
+        return None
+    return WaveCandidate(
+        "Impulse",
+        "Bullish" if bullish else "Bearish",
+        pivots,
+        ("Start", "1", "2", "3"),
+        states,
+        float(pivots[1].price),
+        "below" if bullish else "above",
+        status="Forming",
+        active_leg=active_leg,
+        forming_label="4",
+        as_of=as_of,
+    )
+
+
+def _evaluate_entry_ready_impulse(
+    pivots: tuple[Pivot, ...],
+    as_of: pd.Timestamp | None,
+) -> WaveCandidate | None:
+    if len(pivots) != 5:
+        raise ValueError("an entry-ready Impulse requires Start and Waves 1-4")
+    _validate_pivots(pivots)
+    if not _alternates(pivots):
+        return None
+    bullish = pivots[0].type == "Low"
+    sign = 1.0 if bullish else -1.0
+    states = (
+        RuleState(
+            "wave_2_retracement",
+            sign * (pivots[2].price - pivots[0].price) >= 0,
+            "Wave 2 must not pass the origin of Wave 1",
+        ),
+        RuleState(
+            "wave_3_direction",
+            sign * (pivots[3].price - pivots[2].price) > 0,
+            "Wave 3 must advance in the impulse direction",
+        ),
+        RuleState(
+            "wave_4_no_overlap",
+            sign * (pivots[4].price - pivots[1].price) > 0,
+            "Wave 4 must remain outside Wave 1 territory",
+        ),
+    )
+    if not all(item.passed for item in states):
+        return None
+    return WaveCandidate(
+        "Impulse",
+        "Bullish" if bullish else "Bearish",
+        pivots,
+        ("Start", "1", "2", "3", "4"),
+        states,
+        float(pivots[1].price),
+        "below" if bullish else "above",
+        status="EntryReady",
+        as_of=as_of,
+    )
+
+
+def _evaluate_forming_zigzag(
+    pivots: tuple[Pivot, ...],
+    active_leg: ActiveLeg,
+    as_of: pd.Timestamp | None,
+) -> WaveCandidate | None:
+    if len(pivots) != 2:
+        raise ValueError("a forming ZigZag requires an origin and Wave A")
+    _validate_pivots(pivots)
+    if not _alternates(pivots):
+        return None
+    bearish = pivots[0].type == "High"
+    sign = -1.0 if bearish else 1.0
+    if active_leg.type != ("High" if bearish else "Low"):
+        return None
+    wave_a = sign * (pivots[1].price - pivots[0].price)
+    retracement = sign * (pivots[1].price - active_leg.price)
+    ratio = retracement / wave_a if wave_a > 0 else -1.0
+    state = RuleState(
+        "forming_wave_b_within_origin",
+        0 <= ratio < 0.9,
+        "Forming Wave B must retrace less than 90% of Wave A",
+    )
+    if not state.passed:
+        return None
+    return WaveCandidate(
+        "ZigZag",
+        "Bearish" if bearish else "Bullish",
+        pivots,
+        ("Start", "A"),
+        (state,),
+        float(pivots[0].price),
+        "above" if bearish else "below",
+        status="Forming",
+        active_leg=active_leg,
+        forming_label="B",
+        as_of=as_of,
+    )
+
+
+def _evaluate_entry_ready_zigzag(
+    pivots: tuple[Pivot, ...],
+    as_of: pd.Timestamp | None,
+) -> WaveCandidate | None:
+    if len(pivots) != 3:
+        raise ValueError("an entry-ready ZigZag requires an origin, A and B")
+    _validate_pivots(pivots)
+    if not _alternates(pivots):
+        return None
+    bearish = pivots[0].type == "High"
+    sign = -1.0 if bearish else 1.0
+    wave_a = sign * (pivots[1].price - pivots[0].price)
+    retracement = sign * (pivots[1].price - pivots[2].price)
+    ratio = retracement / wave_a if wave_a > 0 else -1.0
+    state = RuleState(
+        "wave_b_within_origin",
+        0 <= ratio < 0.9,
+        "Wave B must retrace less than 90% of Wave A",
+    )
+    if not state.passed:
+        return None
+    return WaveCandidate(
+        "ZigZag",
+        "Bearish" if bearish else "Bullish",
+        pivots,
+        ("Start", "A", "B"),
+        (state,),
+        float(pivots[0].price),
+        "above" if bearish else "below",
+        status="EntryReady",
+        as_of=as_of,
     )
 
 

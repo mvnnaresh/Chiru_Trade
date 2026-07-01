@@ -16,8 +16,8 @@ from pathlib import Path
 import pandas as pd
 
 from db import TIMEFRAMES, resample_ohlcv
-from engine import WaveCandidate, build_candidates
-from pivots import Pivot, extract_pivots
+from engine import WaveCandidate, build_candidates, find_provisional_candidates
+from pivots import Pivot, PivotState, extract_pivot_state
 from scoring import ConfidenceScore, calculate_rsi, score_candidates
 
 LOGGER = logging.getLogger("elliott_dashboard")
@@ -30,6 +30,7 @@ class DashboardResult:
     pivots: tuple[Pivot, ...]
     rankings: tuple[tuple[WaveCandidate, ConfidenceScore], ...]
     rsi: pd.Series
+    pivot_state: PivotState | None = None
 
 
 def discover_databases(directory: str | Path = ".") -> tuple[Path, ...]:
@@ -56,10 +57,12 @@ def compute_dashboard(
     if candles.empty or len(candles) < atr_period:
         return DashboardResult(candles, (), (), empty_rsi)
 
-    pivots = tuple(
-        extract_pivots(candles, atr_multiplier, atr_period=atr_period)
+    pivot_state = extract_pivot_state(
+        candles, atr_multiplier, atr_period=atr_period
     )
+    pivots = pivot_state.confirmed
     candidates = build_candidates(pivots)
+    candidates.extend(find_provisional_candidates(pivot_state))
     scores = score_candidates(candidates, candles)
     rankings = tuple(
         sorted(scores.items(), key=lambda item: item[1].total, reverse=True)
@@ -69,6 +72,7 @@ def compute_dashboard(
         pivots=pivots,
         rankings=rankings,
         rsi=calculate_rsi(candles),
+        pivot_state=pivot_state,
     )
 
 
@@ -76,13 +80,29 @@ def target_zone(candidate: WaveCandidate) -> tuple[float, float]:
     """Return deterministic lower/upper Fibonacci target-zone bounds."""
     sign = 1.0 if candidate.direction == "Bullish" else -1.0
     first_leg = abs(candidate.pivots[1].price - candidate.pivots[0].price)
-    if candidate.pattern == "Impulse":
+    if candidate.status == "Forming" and candidate.active_leg is not None:
+        anchor = candidate.active_leg.price
+        projections = (anchor + sign * first_leg, anchor + sign * 1.618 * first_leg)
+    elif candidate.pattern == "Impulse":
         anchor = candidate.pivots[4].price
         projections = (anchor + sign * 1.0 * first_leg, anchor + sign * 1.618 * first_leg)
     else:
         anchor = candidate.pivots[2].price
         projections = (anchor + sign * 1.0 * first_leg, anchor + sign * 1.618 * first_leg)
     return min(projections), max(projections)
+
+
+def _setup_endpoint(candidate: WaveCandidate) -> tuple[pd.Timestamp, float]:
+    """Return the currently observable Wave 4/B setup endpoint."""
+    if candidate.status == "Forming" and candidate.active_leg is not None:
+        return candidate.active_leg.timestamp, candidate.active_leg.price
+    setup_label = "4" if candidate.pattern == "Impulse" else "B"
+    if setup_label in candidate.labels:
+        index = candidate.labels.index(setup_label)
+        pivot = candidate.pivots[index]
+        return pivot.timestamp, pivot.price
+    pivot = candidate.pivots[-1]
+    return pivot.timestamp, pivot.price
 
 
 def format_setup_alert(
@@ -95,8 +115,7 @@ def format_setup_alert(
     """Build an alert only for a newly completed Wave 4 or Wave B setup."""
     if (
         score.total < threshold
-        or not candidate.labels
-        or candidate.labels[-1] not in {"4", "B"}
+        or not _is_tradeable_setup(candidate)
     ):
         return None
     low, high = target_zone(candidate)
@@ -184,40 +203,62 @@ def build_lightweight_charts(
     ):
         if not enabled:
             continue
+        wave_data = [
+            {"time": _chart_time(pivot.timestamp), "value": pivot.price}
+            for pivot in candidate.pivots
+        ]
+        if candidate.status == "Forming" and candidate.active_leg is not None:
+            wave_data.append(
+                {
+                    "time": _chart_time(candidate.active_leg.timestamp),
+                    "value": candidate.active_leg.price,
+                }
+            )
+        wave_markers = [
+            {
+                "time": _chart_time(pivot.timestamp),
+                "position": "aboveBar" if pivot.type == "High" else "belowBar",
+                "color": color,
+                "shape": "circle",
+                "text": label,
+            }
+            for label, pivot in candidate.labeled_waves
+        ]
+        if candidate.status == "Forming" and candidate.active_leg is not None:
+            wave_markers.append(
+                {
+                    "time": _chart_time(candidate.active_leg.timestamp),
+                    "position": (
+                        "aboveBar"
+                        if candidate.active_leg.type == "High"
+                        else "belowBar"
+                    ),
+                    "color": color,
+                    "shape": "circle",
+                    "text": f"{candidate.forming_label}?",
+                }
+            )
         price_series.append(
             {
                 "type": "Line",
-                "data": [
-                    {"time": _chart_time(pivot.timestamp), "value": pivot.price}
-                    for pivot in candidate.pivots
-                ],
+                "data": wave_data,
                 "options": {
                     "color": color,
                     "lineWidth": 3 if rank - 1 == selected_index else 1,
+                    "lineStyle": 2 if candidate.status == "Forming" else 0,
                     "priceLineVisible": False,
                     "lastValueVisible": False,
-                    "title": "",
+                    "title": f"#{rank} {candidate.pattern} · {candidate.status}",
                 },
-                "markers": [
-                    {
-                        "time": _chart_time(pivot.timestamp),
-                        "position": "aboveBar"
-                        if pivot.type == "High"
-                        else "belowBar",
-                        "color": color,
-                        "shape": "circle",
-                        "text": label,
-                    }
-                    for label, pivot in candidate.labeled_waves
-                ] if rank - 1 == selected_index else [],
+                "markers": wave_markers if rank - 1 == selected_index else [],
             }
         )
 
     if result.rankings:
         selected_index = min(selected_index, len(result.rankings) - 1)
         selected_candidate = result.rankings[selected_index][0]
-        setup_index = 4 if selected_candidate.pattern == "Impulse" else 2
-        first_time = _chart_time(selected_candidate.pivots[setup_index].timestamp)
+        setup_timestamp, _setup_price = _setup_endpoint(selected_candidate)
+        first_time = _chart_time(setup_timestamp)
         last_time = _chart_time(candles.index[-1])
         target_low, target_high = target_zone(selected_candidate)
         for price, color, title in (
@@ -314,6 +355,9 @@ def marker_status(
     if not enabled:
         return threshold_text, "Overlay disabled", "Overlay disabled"
     if not tradeable:
+        if enabled[0][0].status == "Forming":
+            label = f"Forming Wave {enabled[0][0].forming_label}"
+            return threshold_text, label, label
         return threshold_text, "Awaiting Wave 4/B", "Awaiting Wave 4/B"
 
     candidate, score = tradeable[0]
@@ -351,7 +395,18 @@ def system_hints(
         confidence,
         f"Lifecycle: {lifecycle}",
     ]
-    if lifecycle != "Active":
+    if candidate.status == "Forming":
+        hints.extend(
+            (
+                "Entry gate: Pending — Wave 4/B endpoint is not confirmed",
+                "Marker decision: Hidden — forming structures are watch-only",
+                f"Next required event: Confirm the provisional Wave "
+                f"{candidate.forming_label} pivot",
+                "Trading interpretation: Watchlist candidate; "
+                "not a current trade signal",
+            )
+        )
+    elif lifecycle != "Active":
         hints.extend(
             (
                 f"Entry gate: Failed — lifecycle is {lifecycle.lower()}",
@@ -498,7 +553,8 @@ def _chart_time(timestamp: pd.Timestamp) -> int:
 
 def _candidate_name(index: int, candidate: WaveCandidate, score: ConfidenceScore) -> str:
     return (
-        f"#{index + 1} | {candidate.pattern} | {candidate.direction} | "
+        f"#{index + 1} | {candidate.pattern} | {candidate.status} | "
+        f"{candidate.direction} | "
         f"{score.total:.1f}/100"
     )
 
@@ -511,15 +567,20 @@ def recent_rankings(
     """Limit the working set to paths ending near the current market edge."""
     cutoff = pd.Timestamp(latest_timestamp) - pd.Timedelta(days=days)
     return tuple(
-        item for item in rankings if item[0].pivots[-1].timestamp >= cutoff
+        item
+        for item in rankings
+        if _setup_endpoint(item[0])[0] >= cutoff
     )
 
 
 def candidate_lifecycle(
     candidate: WaveCandidate, candles: pd.DataFrame
 ) -> str:
-    """Classify a completed path using only candles after its final pivot."""
-    future = candles.loc[candles.index > candidate.pivots[-1].timestamp]
+    """Classify a path using only candles after its causal detection point."""
+    if candidate.status == "Forming":
+        return "Forming"
+    observable_at = candidate.as_of or candidate.pivots[-1].timestamp
+    future = candles.loc[candles.index > observable_at]
     if future.empty:
         return "Active"
     target_low, target_high = target_zone(candidate)
@@ -546,10 +607,20 @@ def actionable_rankings(
     rankings: tuple[tuple[WaveCandidate, ConfidenceScore], ...],
     candles: pd.DataFrame,
 ) -> tuple[tuple[WaveCandidate, ConfidenceScore], ...]:
-    return tuple(
+    active = [
         item
         for item in rankings
-        if candidate_lifecycle(item[0], candles) == "Active"
+        if candidate_lifecycle(item[0], candles) in {"Active", "Forming"}
+    ]
+    stage_priority = {"EntryReady": 0, "Forming": 1, "Completed": 2}
+    return tuple(
+        sorted(
+            active,
+            key=lambda item: (
+                stage_priority.get(item[0].status, 3),
+                -item[1].total,
+            ),
+        )
     )
 
 
@@ -561,7 +632,8 @@ def focus_dashboard(
     """Return a chart-only window centered on the selected structure."""
     index = result.candles.index
     start_position = int(index.searchsorted(candidate.pivots[0].timestamp))
-    end_position = int(index.searchsorted(candidate.pivots[-1].timestamp, side="right"))
+    endpoint_time, _endpoint_price = _setup_endpoint(candidate)
+    end_position = int(index.searchsorted(endpoint_time, side="right"))
     start = max(0, start_position - padding_bars)
     end = min(len(index), end_position + padding_bars)
     candles = result.candles.iloc[start:end]
@@ -570,6 +642,7 @@ def focus_dashboard(
         pivots=result.pivots,
         rankings=result.rankings,
         rsi=result.rsi.reindex(candles.index),
+        pivot_state=result.pivot_state,
     )
 
 
@@ -731,7 +804,11 @@ def _render_single_chart() -> None:
         scoped_rankings = result.rankings
     scoped_rankings = pattern_rankings(scoped_rankings, pattern_view)
     view_result = DashboardResult(
-        result.candles, result.pivots, scoped_rankings, result.rsi
+        result.candles,
+        result.pivots,
+        scoped_rankings,
+        result.rsi,
+        result.pivot_state,
     )
 
     last_close = float(result.candles.iloc[-1]["close"])
@@ -815,7 +892,7 @@ def _render_single_chart() -> None:
                     {candidate.pattern} · {candidate.direction}
                   </div>
                   <div style="color:#8c96a5;font-size:.7rem;margin-top:.2rem">
-                    Lifecycle: {lifecycle}
+                    Stage: {candidate.status} · Lifecycle: {lifecycle}
                   </div>
                 </div>
                 <div class="terminal-panel">
@@ -884,6 +961,21 @@ def _render_single_chart() -> None:
                     )
 
     with chart_col:
+        st.markdown(
+            "<div style='display:flex;gap:1.1rem;align-items:center;"
+            "font-size:.68rem;color:#AAB2BF;margin:.05rem 0 .55rem'>"
+            "<span><b style='color:#F4F7FA'>LEGEND</b></span>"
+            "<span><i style='display:inline-block;width:22px;border-top:"
+            "2px solid #00D4FF;margin-right:5px'></i>Completed</span>"
+            "<span><i style='display:inline-block;width:22px;border-top:"
+            "2px dashed #FFB000;margin-right:5px'></i>Forming</span>"
+            "<span><b style='color:#18C98B;margin-right:5px'>▲</b>"
+            "EntryReady bullish</span>"
+            "<span><b style='color:#F05D68;margin-right:5px'>▼</b>"
+            "EntryReady bearish</span>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
         threshold_text, buy_text, sell_text = marker_status(
             view_result.rankings, overlays, alert_threshold
         )
@@ -928,6 +1020,7 @@ def _render_single_chart() -> None:
                     {
                         "Rank": index + 1,
                         "Pattern": candidate.pattern,
+                        "Stage": candidate.status,
                         "Direction": candidate.direction,
                         "Score": score.total,
                         "Lifecycle": candidate_lifecycle(
@@ -982,7 +1075,11 @@ def _render_single_chart() -> None:
 
 def _is_tradeable_setup(candidate: WaveCandidate) -> bool:
     """Whether the terminal pivot is the actionable Wave 4 or Wave B."""
-    return bool(candidate.labels) and candidate.labels[-1] in {"4", "B"}
+    return (
+        candidate.status == "EntryReady"
+        and bool(candidate.labels)
+        and candidate.labels[-1] in {"4", "B"}
+    )
 
 
 def _has_completed_trade_setup(candidate: WaveCandidate) -> bool:
@@ -1015,9 +1112,10 @@ def scan_global_markets(
                 errors.append(f"{database.name} {timeframe}: {error}")
                 continue
             for candidate, score in result.rankings:
-                if not _has_completed_trade_setup(candidate):
+                if candidate.status not in {"Forming", "EntryReady"}:
                     continue
-                if candidate_lifecycle(candidate, result.candles) != "Active":
+                lifecycle = candidate_lifecycle(candidate, result.candles)
+                if lifecycle not in {"Forming", "Active"}:
                     continue
                 target_low, target_high = target_zone(candidate)
                 rows.append(
@@ -1025,6 +1123,7 @@ def scan_global_markets(
                         "Market": database.stem,
                         "Timeframe": timeframe,
                         "Pattern": candidate.pattern,
+                        "Setup Stage": candidate.status,
                         "Direction": candidate.direction,
                         "Confidence Score": score.total,
                         "Invalidation Price": candidate.invalidation_level,
@@ -1037,6 +1136,7 @@ def scan_global_markets(
         "Market",
         "Timeframe",
         "Pattern",
+        "Setup Stage",
         "Direction",
         "Confidence Score",
         "Invalidation Price",
@@ -1056,7 +1156,7 @@ def _render_global_scanner() -> None:
     st.markdown("## Global Market Scanner")
     st.caption(
         "Batch scan of every local market across every registered timeframe. "
-        "Only active structures with a completed Wave 4 or Wave B are shown."
+        "Shows Forming watch candidates and confirmed EntryReady Wave 4/B setups."
     )
     atr_multiplier = float(st.session_state.get("atr_multiplier", 2.0))
     atr_period = int(st.session_state.get("atr_period", 14))

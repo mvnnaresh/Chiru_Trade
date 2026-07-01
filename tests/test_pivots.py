@@ -2,7 +2,7 @@ import pandas as pd
 import pandas.testing as pdt
 import pytest
 
-from pivots import Pivot, calculate_atr, extract_pivots
+from pivots import ActiveLeg, Pivot, calculate_atr, extract_pivot_state, extract_pivots
 
 
 def make_ohlc(highs, lows, closes=None):
@@ -86,6 +86,47 @@ def test_unconfirmed_last_extreme_is_not_returned():
 
     assert pivots == [Pivot(frame.index[2], 100.0, "Low", 2.0)]
     assert all(pivot.price != 106 for pivot in pivots)
+
+
+def test_active_leg_is_separate_from_confirmed_pivots():
+    frame = make_ohlc(
+        highs=[100, 101, 102, 104, 106],
+        lows=[98, 99, 100, 102, 104],
+    )
+
+    state = extract_pivot_state(frame, multiplier=1.5, atr_period=3)
+
+    assert state.confirmed == (Pivot(frame.index[2], 100.0, "Low", 2.0),)
+    assert state.active_leg == ActiveLeg(
+        frame.index[4], 106.0, "High", 8 / 3, "up"
+    )
+    assert state.as_of == frame.index[-1]
+    assert state.active_leg.timestamp > state.confirmed[-1].timestamp
+
+
+def test_active_leg_revision_is_causal_and_does_not_rewrite_confirmed_history():
+    frame = make_ohlc(
+        highs=[100, 101, 102, 104, 106, 108],
+        lows=[98, 99, 100, 102, 104, 106],
+    )
+
+    earlier = extract_pivot_state(frame.iloc[:-1], multiplier=1.5, atr_period=3)
+    later = extract_pivot_state(frame, multiplier=1.5, atr_period=3)
+
+    assert earlier.confirmed == later.confirmed
+    assert earlier.active_leg is not None and later.active_leg is not None
+    assert earlier.active_leg.price == 106.0
+    assert later.active_leg.price == 108.0
+    assert earlier.as_of < later.as_of
+
+
+def test_active_leg_is_absent_until_direction_is_established():
+    frame = make_ohlc(highs=[101, 101, 101], lows=[99, 99, 99])
+
+    state = extract_pivot_state(frame, multiplier=2.0, atr_period=3)
+
+    assert state.confirmed == ()
+    assert state.active_leg is None
 
 
 @pytest.mark.parametrize(

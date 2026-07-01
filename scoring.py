@@ -72,10 +72,160 @@ def score_candidates(
         "Triangle": _score_triangle,
     }
     scores = {
-        candidate: scorers[candidate.pattern](candidate, rsi)
+        candidate: (
+            _score_provisional(candidate, rsi)
+            if candidate.status in {"Forming", "EntryReady"}
+            else scorers[candidate.pattern](candidate, rsi)
+        )
         for candidate in candidates
     }
     return MappingProxyType(scores)
+
+
+def _score_provisional(
+    candidate: WaveCandidate, rsi: pd.Series
+) -> ConfidenceScore:
+    if candidate.pattern == "Impulse":
+        return _score_provisional_impulse(candidate, rsi)
+    if candidate.pattern == "ZigZag":
+        return _score_provisional_zigzag(candidate, rsi)
+    raise ValueError(
+        f"{candidate.status} scoring is not defined for {candidate.pattern}"
+    )
+
+
+def _score_provisional_impulse(
+    candidate: WaveCandidate, rsi: pd.Series
+) -> ConfidenceScore:
+    pivots = candidate.pivots
+    if len(pivots) not in {4, 5}:
+        raise ValueError("a provisional Impulse requires Waves 1-3 or 1-4")
+    sign = 1.0 if candidate.direction == "Bullish" else -1.0
+    wave_1 = sign * (pivots[1].price - pivots[0].price)
+    wave_2 = sign * (pivots[1].price - pivots[2].price)
+    wave_3 = sign * (pivots[3].price - pivots[2].price)
+    wave_4_endpoint = (
+        candidate.active_leg.price
+        if candidate.status == "Forming" and candidate.active_leg is not None
+        else pivots[4].price
+        if len(pivots) == 5
+        else pivots[3].price
+    )
+    wave_4 = sign * (pivots[3].price - wave_4_endpoint)
+    retracement = wave_2 / wave_1
+    extension = wave_3 / wave_1
+    wave_2_points = _range_alignment(retracement, 0.5, 0.618, 0.25, 25)
+    wave_3_points = _target_alignment(extension, (1.618, 2.618), 0.382, 25)
+
+    wave_1_strength = _wave_momentum(
+        rsi, pivots[0].timestamp, pivots[1].timestamp, sign
+    )
+    wave_3_strength = _wave_momentum(
+        rsi, pivots[2].timestamp, pivots[3].timestamp, sign
+    )
+    wave_3_confirms = (
+        wave_1_strength is not None
+        and wave_3_strength is not None
+        and wave_3_strength >= wave_1_strength
+    )
+    momentum_points = 30.0 if wave_3_confirms else 0.0
+
+    wave_2_depth = wave_2 / wave_1
+    wave_4_depth = wave_4 / wave_3
+    alternates = (
+        (wave_2_depth >= 0.5 and wave_4_depth <= 0.382)
+        or (wave_4_depth >= 0.5 and wave_2_depth <= 0.382)
+    )
+    alternation_points = 20.0 if alternates else 0.0
+    items = (
+        ScoreItem(
+            "Fibonacci Alignment",
+            wave_2_points,
+            25,
+            f"{candidate.status} Wave 2 retracement={retracement:.4f}",
+        ),
+        ScoreItem(
+            "Fibonacci Alignment",
+            wave_3_points,
+            25,
+            f"{candidate.status} Wave 3 extension={extension:.4f}",
+        ),
+        ScoreItem(
+            "Momentum Verification",
+            momentum_points,
+            30,
+            "Confirmed Wave 3 RSI equals or exceeds Wave 1"
+            if wave_3_confirms
+            else "Wave 3 lacks available RSI confirmation versus Wave 1",
+        ),
+        ScoreItem(
+            "Channeling & Alternation",
+            alternation_points,
+            20,
+            f"{candidate.status} corrective depths: "
+            f"Wave 2={wave_2_depth:.4f}, Wave 4={wave_4_depth:.4f}",
+        ),
+    )
+    return _assemble_score(items)
+
+
+def _score_provisional_zigzag(
+    candidate: WaveCandidate, rsi: pd.Series
+) -> ConfidenceScore:
+    pivots = candidate.pivots
+    if len(pivots) not in {2, 3}:
+        raise ValueError("a provisional ZigZag requires Wave A or Waves A-B")
+    sign = 1.0 if candidate.direction == "Bullish" else -1.0
+    wave_a = sign * (pivots[1].price - pivots[0].price)
+    endpoint = (
+        candidate.active_leg
+        if candidate.status == "Forming"
+        else None
+    )
+    wave_b_price = endpoint.price if endpoint is not None else pivots[2].price
+    wave_b_time = endpoint.timestamp if endpoint is not None else pivots[2].timestamp
+    wave_b = sign * (pivots[1].price - wave_b_price)
+    b_ratio = wave_b / wave_a
+    b_points = _range_alignment(b_ratio, 0.382, 0.786, 0.236, 50)
+
+    a_strength = _wave_momentum(
+        rsi, pivots[0].timestamp, pivots[1].timestamp, sign
+    )
+    momentum_points = (
+        max(0.0, min(30.0, (a_strength - 50.0) * 1.5))
+        if a_strength is not None
+        else 0.0
+    )
+    duration_a = (pivots[1].timestamp - pivots[0].timestamp).total_seconds()
+    duration_b = (wave_b_time - pivots[1].timestamp).total_seconds()
+    duration_ratio = (
+        min(duration_a, duration_b) / max(duration_a, duration_b)
+        if duration_a > 0 and duration_b > 0
+        else 0.0
+    )
+    proportion_points = 20.0 * duration_ratio
+    items = (
+        ScoreItem(
+            "Fibonacci Alignment",
+            b_points,
+            50,
+            f"{candidate.status} Wave B/A={b_ratio:.4f}; "
+            "guideline range=0.382-0.786",
+        ),
+        ScoreItem(
+            "Momentum Verification",
+            momentum_points,
+            30,
+            f"Available Wave A directional RSI strength={a_strength}",
+        ),
+        ScoreItem(
+            "Channeling & Alternation",
+            proportion_points,
+            20,
+            f"{candidate.status} Wave B/A duration ratio={duration_ratio:.4f}",
+        ),
+    )
+    return _assemble_score(items)
 
 
 def _score_impulse(candidate: WaveCandidate, rsi: pd.Series) -> ConfidenceScore:

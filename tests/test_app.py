@@ -22,7 +22,7 @@ from app import (
     target_zone,
 )
 from engine import RuleState, WaveCandidate
-from pivots import Pivot
+from pivots import ActiveLeg, Pivot
 from scoring import ConfidenceScore
 
 
@@ -43,6 +43,8 @@ def candidate(terminal_label="4"):
         (RuleState("partial", True, "valid"),),
         104.0,
         "below",
+        status="EntryReady" if terminal_label in {"4", "B"} else "Completed",
+        as_of=index[-1],
     )
 
 
@@ -192,6 +194,56 @@ def test_trade_setup_markers_apply_overlay_threshold_and_direction():
     ]
 
 
+def test_forming_overlay_is_dashed_and_labels_unconfirmed_endpoint():
+    ready = candidate()
+    active_leg = ActiveLeg(
+        ready.pivots[-1].timestamp,
+        ready.pivots[-1].price,
+        "Low",
+        1.0,
+        "down",
+    )
+    forming = replace(
+        ready,
+        pivots=ready.pivots[:4],
+        labels=ready.labels[:4],
+        status="Forming",
+        active_leg=active_leg,
+        forming_label="4",
+    )
+    index = pd.date_range("2026-01-01", periods=5, freq="5min", tz="UTC")
+    candles = pd.DataFrame(
+        {
+            "open": [100] * 5,
+            "high": [121] * 5,
+            "low": [99] * 5,
+            "close": [112] * 5,
+            "volume": [1] * 5,
+        },
+        index=index,
+    )
+    result = DashboardResult(
+        candles,
+        forming.pivots,
+        ((forming, score(85)),),
+        pd.Series(50, index=index, name="rsi"),
+    )
+
+    charts = build_lightweight_charts(
+        result, (True, False, False), alert_threshold=75
+    )
+    wave = charts[0]["series"][1]
+
+    assert wave["options"]["lineStyle"] == 2
+    assert wave["options"]["title"] == "#1 Impulse · Forming"
+    assert wave["data"][-1] == {
+        "time": int(active_leg.timestamp.timestamp()),
+        "value": active_leg.price,
+    }
+    assert wave["markers"][-1]["text"] == "4?"
+    assert charts[0]["series"][0]["markers"] == []
+
+
 def test_trade_setup_markers_clear_when_disabled_below_gate_or_not_terminal():
     active = candidate()
     completed = replace(active, labels=("Start", "1", "2", "3", "5"))
@@ -244,6 +296,20 @@ def test_marker_status_explains_absent_tradeable_setup():
     assert marker_status(
         ((completed, score(95)),), (False, False, False), 75
     ) == ("75.0", "Overlay disabled", "Overlay disabled")
+
+    forming = replace(
+        candidate(),
+        pivots=candidate().pivots[:4],
+        labels=("Start", "1", "2", "3"),
+        status="Forming",
+        active_leg=ActiveLeg(
+            candidate().pivots[-1].timestamp, 112, "Low", 1, "down"
+        ),
+        forming_label="4",
+    )
+    assert marker_status(
+        ((forming, score(95)),), (True, False, False), 75
+    ) == ("75.0", "Forming Wave 4", "Forming Wave 4")
 
 
 def test_system_hints_distinguish_completed_and_actionable_setups():
@@ -324,6 +390,50 @@ def test_candidate_lifecycle_and_actionable_filtering():
     invalidated = base.copy()
     invalidated.loc[index[-1], "low"] = 103
     assert candidate_lifecycle(active, invalidated) == "Invalidated"
+
+
+def test_actionable_scope_prioritizes_entry_ready_then_forming():
+    ready = candidate()
+    completed = replace(
+        ready,
+        status="Completed",
+        labels=("Start", "1", "2", "3", "5"),
+    )
+    forming = replace(
+        ready,
+        pivots=ready.pivots[:4],
+        labels=("Start", "1", "2", "3"),
+        status="Forming",
+        active_leg=ActiveLeg(
+            ready.pivots[-1].timestamp, 112, "Low", 1, "down"
+        ),
+        forming_label="4",
+    )
+    candles = pd.DataFrame(
+        {
+            "open": [110],
+            "high": [111],
+            "low": [109],
+            "close": [110],
+            "volume": [1],
+        },
+        index=pd.DatetimeIndex([ready.pivots[-1].timestamp]),
+    )
+
+    ordered = actionable_rankings(
+        (
+            (completed, score(99)),
+            (forming, score(70)),
+            (ready, score(80)),
+        ),
+        candles,
+    )
+
+    assert [item[0].status for item in ordered] == [
+        "EntryReady",
+        "Forming",
+        "Completed",
+    ]
 
 
 def test_focus_dashboard_slices_candles_and_rsi_around_selected_path():

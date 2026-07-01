@@ -10,8 +10,9 @@ from engine import (
     evaluate_impulse,
     evaluate_triangle,
     evaluate_zigzag,
+    find_provisional_candidates,
 )
-from pivots import Pivot
+from pivots import ActiveLeg, Pivot, PivotState
 
 
 def pivot(minute, price, kind):
@@ -79,6 +80,119 @@ def test_valid_bullish_impulse_has_labels_rules_and_exact_floor():
     assert candidate.invalidation_level == 110.0
     assert candidate.invalidation_side == "below"
     assert candidate.labeled_waves[4][0] == "4"
+    assert candidate.status == "Completed"
+
+
+def test_forming_impulse_keeps_active_wave4_outside_confirmed_pivots():
+    confirmed = bullish_impulse()[:4]
+    as_of = confirmed[-1].timestamp + pd.Timedelta(minutes=5)
+    active = ActiveLeg(as_of, 114.0, "Low", 2.0, "down")
+
+    candidates = find_provisional_candidates(
+        PivotState(as_of, confirmed, active),
+        include_zigzags=False,
+    )
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.status == "Forming"
+    assert candidate.labels == ("Start", "1", "2", "3")
+    assert candidate.forming_label == "4"
+    assert candidate.active_leg == active
+    assert active not in candidate.pivots
+    assert candidate.invalidation_level == 110.0
+    assert candidate.invalidation_side == "below"
+    assert candidate.as_of == as_of
+
+
+def test_forming_impulse_is_pruned_on_wave1_territory_overlap():
+    confirmed = bullish_impulse()[:4]
+    as_of = confirmed[-1].timestamp + pd.Timedelta(minutes=5)
+    active = ActiveLeg(as_of, 109.0, "Low", 2.0, "down")
+
+    candidates = find_provisional_candidates(
+        PivotState(as_of, confirmed, active),
+        include_zigzags=False,
+    )
+
+    assert candidates == []
+
+
+def test_confirmed_wave4_creates_entry_ready_impulse():
+    confirmed = bullish_impulse()[:5]
+    as_of = confirmed[-1].timestamp + pd.Timedelta(minutes=5)
+
+    candidates = find_provisional_candidates(
+        PivotState(as_of, confirmed, None),
+        include_zigzags=False,
+    )
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.status == "EntryReady"
+    assert candidate.labels[-1] == "4"
+    assert candidate.active_leg is None
+    assert candidate.as_of == as_of
+
+
+def test_forming_and_entry_ready_zigzag_are_causal():
+    start = pivot(0, 120, "High")
+    wave_a = pivot(5, 100, "Low")
+    forming_as_of = wave_a.timestamp + pd.Timedelta(minutes=5)
+    active_b = ActiveLeg(forming_as_of, 110.0, "High", 2.0, "up")
+
+    forming = find_provisional_candidates(
+        PivotState(forming_as_of, (start, wave_a), active_b),
+        include_impulses=False,
+    )
+    confirmed_b = pivot(10, 110, "High")
+    ready_as_of = confirmed_b.timestamp + pd.Timedelta(minutes=5)
+    ready = find_provisional_candidates(
+        PivotState(ready_as_of, (start, wave_a, confirmed_b), None),
+        include_impulses=False,
+    )
+
+    assert len(forming) == 1
+    assert forming[0].status == "Forming"
+    assert forming[0].forming_label == "B"
+    assert forming[0].active_leg == active_b
+    assert len(ready) == 1
+    assert ready[0].status == "EntryReady"
+    assert ready[0].labels == ("Start", "A", "B")
+
+
+def test_provisional_zigzag_is_pruned_when_wave_b_reaches_origin():
+    start = pivot(0, 120, "High")
+    wave_a = pivot(5, 100, "Low")
+    as_of = wave_a.timestamp + pd.Timedelta(minutes=5)
+    active_b = ActiveLeg(as_of, 120.0, "High", 2.0, "up")
+
+    candidates = find_provisional_candidates(
+        PivotState(as_of, (start, wave_a), active_b),
+        include_impulses=False,
+    )
+
+    assert candidates == []
+
+
+def test_provisional_state_rejects_noncausal_active_leg_timestamp():
+    confirmed = bullish_impulse()[:4]
+    as_of = confirmed[-1].timestamp + pd.Timedelta(minutes=5)
+    stale = ActiveLeg(confirmed[-1].timestamp, 114.0, "Low", 2.0, "down")
+    future = ActiveLeg(
+        as_of + pd.Timedelta(minutes=5), 114.0, "Low", 2.0, "down"
+    )
+
+    with pytest.raises(ValueError, match="must follow"):
+        find_provisional_candidates(
+            PivotState(as_of, confirmed, stale),
+            include_zigzags=False,
+        )
+    with pytest.raises(ValueError, match="after state as_of"):
+        find_provisional_candidates(
+            PivotState(as_of, confirmed, future),
+            include_zigzags=False,
+        )
 
 
 def test_valid_bearish_impulse_has_exact_ceiling():

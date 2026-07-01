@@ -10,8 +10,9 @@ from engine import (
     evaluate_impulse,
     evaluate_triangle,
     evaluate_zigzag,
+    find_provisional_candidates,
 )
-from pivots import Pivot
+from pivots import ActiveLeg, Pivot, PivotState
 from scoring import calculate_rsi, score_candidates
 
 
@@ -106,6 +107,86 @@ def test_missing_rsi_history_awards_no_momentum_points():
     score = score_candidates([candidate], frame, rsi_period=100)[candidate]
 
     assert score.momentum == 0.0
+
+
+def test_forming_impulse_uses_stage_specific_100_point_matrix(monkeypatch):
+    confirmed = (
+        pivot(0, 100, "Low"),
+        pivot(5, 110, "High"),
+        pivot(10, 104, "Low"),
+        pivot(15, 120.18, "High"),
+    )
+    active = ActiveLeg(
+        pivot(20, 114, "Low").timestamp, 114.0, "Low", 1.0, "down"
+    )
+    candidate = find_provisional_candidates(
+        PivotState(active.timestamp, confirmed, active),
+        include_zigzags=False,
+    )[0]
+    frame = market_frame()
+    rsi = pd.Series(50.0, index=frame.index, name="rsi")
+    rsi.loc[confirmed[0].timestamp : confirmed[1].timestamp] = 60
+    rsi.loc[confirmed[2].timestamp : confirmed[3].timestamp] = 80
+    monkeypatch.setattr(scoring, "calculate_rsi", lambda *_args, **_kwargs: rsi)
+
+    result = score_candidates([candidate], frame)[candidate]
+
+    assert candidate.status == "Forming"
+    assert result.fibonacci == 50
+    assert result.momentum == 30
+    assert result.channeling_alternation == 20
+    assert result.total == 100
+    assert sum(item.maximum for item in result.items) == 100
+    assert all(
+        "Wave 5" not in item.reason and "Wave C" not in item.reason
+        for item in result.items
+    )
+
+
+def test_entry_ready_zigzag_scores_only_available_a_and_b_evidence(monkeypatch):
+    confirmed = (
+        pivot(0, 120, "High"),
+        pivot(5, 100, "Low"),
+        pivot(10, 112, "High"),
+    )
+    candidate = find_provisional_candidates(
+        PivotState(pivot(15, 108, "Low").timestamp, confirmed, None),
+        include_impulses=False,
+    )[0]
+    frame = market_frame()
+    rsi = pd.Series(50.0, index=frame.index, name="rsi")
+    rsi.loc[confirmed[0].timestamp : confirmed[1].timestamp] = 20
+    monkeypatch.setattr(scoring, "calculate_rsi", lambda *_args, **_kwargs: rsi)
+
+    result = score_candidates([candidate], frame)[candidate]
+
+    assert candidate.status == "EntryReady"
+    assert result.fibonacci == 50
+    assert result.momentum == 30
+    assert result.channeling_alternation == 20
+    assert result.total == 100
+    assert sum(item.maximum for item in result.items) == 100
+    assert all("Wave C" not in item.reason for item in result.items)
+
+
+def test_provisional_score_does_not_change_when_future_bars_change():
+    confirmed = (
+        pivot(0, 120, "High"),
+        pivot(5, 100, "Low"),
+        pivot(10, 112, "High"),
+    )
+    candidate = find_provisional_candidates(
+        PivotState(pivot(15, 108, "Low").timestamp, confirmed, None),
+        include_impulses=False,
+    )[0]
+    frame = market_frame()
+    changed = frame.copy()
+    changed.loc[changed.index > candidate.as_of, "close"] = -1000
+
+    original = score_candidates([candidate], frame, rsi_period=3)[candidate]
+    revised = score_candidates([candidate], changed, rsi_period=3)[candidate]
+
+    assert original == revised
 
 
 def test_score_mapping_and_score_objects_are_immutable():

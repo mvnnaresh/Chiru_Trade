@@ -8,6 +8,7 @@ from typing import Literal
 import pandas as pd
 
 PivotType = Literal["High", "Low"]
+SwingDirection = Literal["up", "down"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +19,26 @@ class Pivot:
     price: float
     type: PivotType
     atr: float
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveLeg:
+    """Latest unconfirmed swing extreme known at one causal snapshot."""
+
+    timestamp: pd.Timestamp
+    price: float
+    type: PivotType
+    atr: float
+    direction: SwingDirection
+
+
+@dataclass(frozen=True, slots=True)
+class PivotState:
+    """Immutable confirmed pivots and separate repaintable active-leg state."""
+
+    as_of: pd.Timestamp | None
+    confirmed: tuple[Pivot, ...]
+    active_leg: ActiveLeg | None
 
 
 def calculate_atr(ohlc: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -57,21 +78,42 @@ def extract_pivots(
     low reverses by the threshold calculated at that subsequent candle. The
     inverse applies during a downswing. No provisional final pivot is emitted.
     """
+    return list(
+        extract_pivot_state(
+            ohlc,
+            multiplier,
+            atr_period=atr_period,
+        ).confirmed
+    )
+
+
+def extract_pivot_state(
+    ohlc: pd.DataFrame,
+    multiplier: float,
+    *,
+    atr_period: int = 14,
+) -> PivotState:
+    """Return confirmed pivots plus the latest unconfirmed swing extreme.
+
+    ``active_leg`` is snapshot state, not a confirmed pivot. Its timestamp and
+    price may move as later candles extend the current swing. ``as_of`` records
+    the last candle visible to the calculation so every revision is auditable.
+    """
     _validate_ohlc(ohlc)
     if not isinstance(multiplier, (int, float)) or isinstance(multiplier, bool):
         raise ValueError("multiplier must be a positive number")
     if multiplier <= 0:
         raise ValueError("multiplier must be a positive number")
     if ohlc.empty:
-        return []
+        return PivotState(None, (), None)
 
     atr = calculate_atr(ohlc, atr_period)
     ready = atr.notna() & (atr > 0)
     if not ready.any():
-        return []
+        return PivotState(ohlc.index[-1], (), None)
 
     pivots: list[Pivot] = []
-    direction: Literal["up", "down"] | None = None
+    direction: SwingDirection | None = None
     candidate_high: tuple[pd.Timestamp, float, float] | None = None
     candidate_low: tuple[pd.Timestamp, float, float] | None = None
 
@@ -151,7 +193,24 @@ def extract_pivots(
                 )
                 candidate_low = None
 
-    return pivots
+    active_leg: ActiveLeg | None = None
+    active_candidate = (
+        candidate_high
+        if direction == "up"
+        else candidate_low
+        if direction == "down"
+        else None
+    )
+    if direction is not None and active_candidate is not None:
+        timestamp, price, atr_value = active_candidate
+        active_leg = ActiveLeg(
+            timestamp=timestamp,
+            price=price,
+            type="High" if direction == "up" else "Low",
+            atr=atr_value,
+            direction=direction,
+        )
+    return PivotState(ohlc.index[-1], tuple(pivots), active_leg)
 
 
 def _pivot(candidate: tuple[pd.Timestamp, float, float], kind: PivotType) -> Pivot:
