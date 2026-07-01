@@ -1,6 +1,10 @@
 import sqlite3
 
+from dataclasses import replace
+
 import pandas as pd
+import app as app_module
+from db import TIMEFRAMES
 
 from app import (
     DashboardResult,
@@ -10,8 +14,11 @@ from app import (
     discover_databases,
     focus_dashboard,
     format_setup_alert,
+    marker_status,
     pattern_rankings,
     recent_rankings,
+    scan_global_markets,
+    system_hints,
     target_zone,
 )
 from engine import RuleState, WaveCandidate
@@ -141,6 +148,123 @@ def test_lightweight_chart_specs_include_synced_price_rsi_and_wave_markers():
     )
 
 
+def test_trade_setup_markers_apply_overlay_threshold_and_direction():
+    bullish = candidate()
+    bearish = replace(bullish, direction="Bearish")
+    index = pd.date_range("2026-01-01", periods=5, freq="5min", tz="UTC")
+    candles = pd.DataFrame(
+        {
+            "open": [100] * 5,
+            "high": [121] * 5,
+            "low": [99] * 5,
+            "close": [112] * 5,
+            "volume": [1] * 5,
+        },
+        index=index,
+    )
+    result = DashboardResult(
+        candles,
+        bullish.pivots,
+        ((bullish, score(85)), (bearish, score(90))),
+        pd.Series(50, index=index, name="rsi"),
+    )
+
+    charts = build_lightweight_charts(
+        result, (True, True, False), alert_threshold=80
+    )
+    markers = charts[0]["series"][0]["markers"]
+
+    assert markers == [
+        {
+            "time": int(bullish.pivots[-1].timestamp.timestamp()),
+            "position": "belowBar",
+            "shape": "arrowUp",
+            "color": "#18C98B",
+            "text": "#1 Impulse (85.0)",
+        },
+        {
+            "time": int(bearish.pivots[-1].timestamp.timestamp()),
+            "position": "aboveBar",
+            "shape": "arrowDown",
+            "color": "#F05D68",
+            "text": "#2 Impulse (90.0)",
+        },
+    ]
+
+
+def test_trade_setup_markers_clear_when_disabled_below_gate_or_not_terminal():
+    active = candidate()
+    completed = replace(active, labels=("Start", "1", "2", "3", "5"))
+    index = pd.date_range("2026-01-01", periods=5, freq="5min", tz="UTC")
+    candles = pd.DataFrame(
+        {
+            "open": [100] * 5,
+            "high": [121] * 5,
+            "low": [99] * 5,
+            "close": [112] * 5,
+            "volume": [1] * 5,
+        },
+        index=index,
+    )
+    result = DashboardResult(
+        candles,
+        active.pivots,
+        ((active, score(70)), (completed, score(95))),
+        pd.Series(50, index=index, name="rsi"),
+    )
+
+    charts = build_lightweight_charts(
+        result, (True, True, False), alert_threshold=75
+    )
+
+    assert charts[0]["series"][0]["markers"] == []
+
+
+def test_marker_status_explains_threshold_and_direction():
+    bullish = candidate()
+
+    assert marker_status(((bullish, score(85)),), (True, False, False), 80) == (
+        "80.0",
+        "112.00",
+        "No bearish setup",
+    )
+    assert marker_status(((bullish, score(70)),), (True, False, False), 80) == (
+        "80.0",
+        "Below threshold (70.0)",
+        "Below threshold (70.0)",
+    )
+
+
+def test_marker_status_explains_absent_tradeable_setup():
+    completed = replace(candidate(), labels=("Start", "1", "2", "3", "5"))
+
+    assert marker_status(
+        ((completed, score(95)),), (True, False, False), 75
+    ) == ("75.0", "Awaiting Wave 4/B", "Awaiting Wave 4/B")
+    assert marker_status(
+        ((completed, score(95)),), (False, False, False), 75
+    ) == ("75.0", "Overlay disabled", "Overlay disabled")
+
+
+def test_system_hints_distinguish_completed_and_actionable_setups():
+    active = candidate()
+
+    actionable = system_hints(active, score(85), 75, "Active")
+    completed = system_hints(active, score(85), 75, "Target hit")
+
+    assert "Confidence gate: Passed (85.0 ≥ 75.0)" in actionable
+    assert "Entry gate: Passed — terminal Wave 4/B is present" in actionable
+    assert "Marker decision: Visible — Buy at 112.00" in actionable
+    assert "Invalidation reference: 104.00 floor" in actionable
+    assert "Lifecycle: Target hit" in completed
+    assert "Entry gate: Failed — lifecycle is target hit" in completed
+    assert "Marker decision: Hidden — setup target hit" in completed
+    assert (
+        "Trading interpretation: Historical structure; not a current trade signal"
+        in completed
+    )
+
+
 def test_recent_rankings_filters_by_candidate_completion_time():
     active = candidate()
     ranked = ((active, score()),)
@@ -228,3 +352,50 @@ def test_focus_dashboard_slices_candles_and_rsi_around_selected_path():
     assert focused.candles.index[0] == index[3]
     assert focused.candles.index[-1] == index[9]
     assert focused.rsi.index.equals(focused.candles.index)
+
+
+def test_global_scanner_sorts_active_setups_and_skips_failed_inputs(
+    tmp_path, monkeypatch
+):
+    first = tmp_path / "BTC.db"
+    second = tmp_path / "NIFTY.db"
+    broken = tmp_path / "BROKEN.db"
+    for database in (first, second, broken):
+        database.touch()
+    active = candidate()
+    candles = pd.DataFrame(
+        {
+            "open": [100] * 5,
+            "high": [101] * 5,
+            "low": [105] * 5,
+            "close": [100] * 5,
+            "volume": 1,
+        },
+        index=pd.date_range("2026-01-01", periods=5, freq="5min", tz="UTC"),
+    )
+
+    def fake_compute(database, timeframe, _multiplier, _period):
+        if database.name == "BROKEN.db":
+            raise ValueError("invalid database")
+        confidence = 90 if database.name == "NIFTY.db" else 70
+        return DashboardResult(
+            candles,
+            active.pivots,
+            ((active, score(confidence)),),
+            pd.Series(50, index=candles.index),
+        )
+
+    monkeypatch.setattr(app_module, "compute_dashboard", fake_compute)
+
+    frame, errors = scan_global_markets(
+        (first, second, broken), atr_multiplier=2.0, atr_period=14
+    )
+
+    timeframe_count = len(TIMEFRAMES)
+    assert list(frame["Confidence Score"]) == [90] * timeframe_count + [
+        70
+    ] * timeframe_count
+    assert list(frame["Market"][:timeframe_count]) == ["NIFTY"] * timeframe_count
+    assert set(frame["Timeframe"]) == set(TIMEFRAMES)
+    assert frame.iloc[0]["Pattern"] == "Impulse"
+    assert len(errors) == timeframe_count

@@ -5,7 +5,12 @@ import pandas.testing as pdt
 import pytest
 
 import scoring
-from engine import evaluate_impulse, evaluate_zigzag
+from engine import (
+    evaluate_flat,
+    evaluate_impulse,
+    evaluate_triangle,
+    evaluate_zigzag,
+)
 from pivots import Pivot
 from scoring import calculate_rsi, score_candidates
 
@@ -131,6 +136,62 @@ def test_bearish_zigzag_receives_bounded_auditable_score():
     assert score.momentum <= 30
     assert score.channeling_alternation <= 20
     assert all(item.reason for item in score.items)
+
+
+def test_flat_scores_maximum_fibonacci_at_expanded_b_and_regular_c(monkeypatch):
+    path = (
+        pivot(0, 120, "High"),
+        pivot(5, 100, "Low"),
+        pivot(10, 120, "High"),
+        pivot(15, 100, "Low"),
+    )
+    candidate = evaluate_flat(path)
+    assert candidate is not None
+    frame = market_frame()
+    rsi = pd.Series(float("nan"), index=frame.index, name="rsi")
+    rsi.loc[frame.index[1:5]] = 30
+    rsi.loc[frame.index[11:15]] = 20
+    monkeypatch.setattr(scoring, "calculate_rsi", lambda *_args, **_kwargs: rsi)
+
+    result = score_candidates([candidate], frame)[candidate]
+
+    assert result.fibonacci == 50
+    assert result.momentum == 20
+    assert result.channeling_alternation == 20
+    assert result.total == 90
+    assert any("expanded range" in item.reason for item in result.items)
+
+
+def test_triangle_scores_clean_contraction_wedge_and_declining_rsi(monkeypatch):
+    path = (
+        pivot(0, 120, "High"),
+        pivot(10, 100, "Low"),
+        pivot(20, 114, "High"),
+        pivot(30, 104.2, "Low"),
+        pivot(40, 111.06, "High"),
+        pivot(50, 106.258, "Low"),
+    )
+    candidate = evaluate_triangle(path)
+    assert candidate is not None
+    frame = market_frame(periods=60)
+    rsi = pd.Series(float("nan"), index=frame.index, name="rsi")
+    for start, end, value in (
+        (1, 9, 20),
+        (11, 19, 70),
+        (21, 29, 40),
+        (31, 39, 50),
+        (41, 49, 60),
+    ):
+        rsi.loc[frame.index[start:end]] = value
+    monkeypatch.setattr(scoring, "calculate_rsi", lambda *_args, **_kwargs: rsi)
+
+    result = score_candidates([candidate], frame)[candidate]
+
+    assert result.fibonacci == 50
+    assert result.momentum == 30
+    assert result.channeling_alternation == 20
+    assert result.total == 100
+    assert any("contracting wedge" in item.reason for item in result.items)
 
 
 def test_rejects_invalid_market_data_or_candidate_types():

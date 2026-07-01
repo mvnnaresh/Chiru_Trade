@@ -3,7 +3,14 @@ import sqlite3
 import pandas as pd
 import pytest
 
-from db import ingest_m5, load_m5, resample_ohlcv, setup_database
+from db import (
+    get_asset_profile,
+    ingest_m5,
+    load_m5,
+    resample_ohlcv,
+    set_asset_profile,
+    setup_database,
+)
 
 
 def make_candles(periods=48, start="2026-01-01 00:00:00+00:00"):
@@ -142,6 +149,89 @@ def test_resample_excludes_incomplete_or_gapped_bars_by_default(tmp_path):
     assert len(including_partial) == 2
 
 
+@pytest.mark.parametrize(
+    ("timeframe", "complete_count", "partial_count"),
+    (("15M", 3, 2), ("30M", 6, 5), ("2H", 24, 23)),
+)
+def test_new_fixed_timeframes_drop_partial_periods(
+    tmp_path, timeframe, complete_count, partial_count
+):
+    database = tmp_path / f"{timeframe}.sqlite"
+    ingest_m5(database, make_candles(periods=complete_count + partial_count))
+
+    complete = resample_ohlcv(database, timeframe)
+    including_partial = resample_ohlcv(database, timeframe, complete_only=False)
+
+    assert list(complete.index) == [pd.Timestamp("2026-01-01T00:00:00Z")]
+    assert len(including_partial) == 2
+
+
+def test_daily_crypto_profile_requires_complete_24_hour_period(tmp_path):
+    database = tmp_path / "BTC.sqlite"
+    set_asset_profile(database, "24_7")
+    ingest_m5(database, make_candles(periods=288 + 20))
+
+    complete = resample_ohlcv(database, "1D")
+    including_partial = resample_ohlcv(database, "1D", complete_only=False)
+
+    assert get_asset_profile(database).label == "24_7"
+    assert list(complete.index) == [pd.Timestamp("2026-01-01T00:00:00Z")]
+    assert len(including_partial) == 2
+
+
+def test_daily_nse_profile_uses_local_session_candle_count(tmp_path):
+    database = tmp_path / "NIFTY.sqlite"
+    set_asset_profile(database, "NSE")
+    first_session = make_candles(
+        periods=75, start="2026-01-01T03:45:00Z"
+    )
+    partial_session = make_candles(
+        periods=20, start="2026-01-02T03:45:00Z"
+    )
+    ingest_m5(database, pd.concat((first_session, partial_session)))
+
+    complete = resample_ohlcv(database, "1D")
+    including_partial = resample_ohlcv(database, "1D", complete_only=False)
+
+    assert get_asset_profile(database).label == "NSE"
+    assert list(complete.index) == [pd.Timestamp("2025-12-31T18:30:00Z")]
+    assert len(including_partial) == 2
+
+
+def test_weekly_crypto_profile_requires_seven_complete_days(tmp_path):
+    database = tmp_path / "BTC.sqlite"
+    set_asset_profile(database, "24_7")
+    ingest_m5(
+        database,
+        make_candles(periods=(7 * 288) + 20, start="2026-01-05T00:00:00Z"),
+    )
+
+    complete = resample_ohlcv(database, "1W")
+    including_partial = resample_ohlcv(database, "1W", complete_only=False)
+
+    assert list(complete.index) == [pd.Timestamp("2026-01-05T00:00:00Z")]
+    assert len(including_partial) == 2
+
+
+def test_weekly_nse_profile_requires_five_complete_sessions(tmp_path):
+    database = tmp_path / "NIFTY.sqlite"
+    set_asset_profile(database, "NSE")
+    complete_sessions = [
+        make_candles(periods=75, start=f"2026-01-{day:02d}T03:45:00Z")
+        for day in range(5, 10)
+    ]
+    partial_next_week = make_candles(
+        periods=20, start="2026-01-12T03:45:00Z"
+    )
+    ingest_m5(database, pd.concat((*complete_sessions, partial_next_week)))
+
+    complete = resample_ohlcv(database, "1W")
+    including_partial = resample_ohlcv(database, "1W", complete_only=False)
+
+    assert list(complete.index) == [pd.Timestamp("2026-01-04T18:30:00Z")]
+    assert len(including_partial) == 2
+
+
 def test_resample_rejects_unsupported_timeframe(tmp_path):
     with pytest.raises(ValueError, match="1H.*4H"):
-        resample_ohlcv(tmp_path / "market.sqlite", "1D")  # type: ignore[arg-type]
+        resample_ohlcv(tmp_path / "market.sqlite", "1M")

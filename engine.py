@@ -7,7 +7,7 @@ from typing import Literal
 
 from pivots import Pivot
 
-Pattern = Literal["Impulse", "ZigZag"]
+Pattern = Literal["Impulse", "ZigZag", "Flat", "Triangle"]
 Direction = Literal["Bullish", "Bearish"]
 BreachSide = Literal["below", "above"]
 
@@ -61,6 +61,8 @@ class WaveDAG:
         *,
         include_impulses: bool = True,
         include_zigzags: bool = True,
+        include_flats: bool = True,
+        include_triangles: bool = True,
     ) -> list[WaveCandidate]:
         """Return all valid contiguous completed patterns in start-time order."""
         edge_set = set(self.edges)
@@ -77,11 +79,25 @@ class WaveDAG:
                     candidate = evaluate_zigzag(self.nodes[start : start + 4])
                     if candidate is not None:
                         candidates.append(candidate)
+        if include_flats:
+            for start in range(len(self.nodes) - 3):
+                if _is_path(edge_set, start, 4):
+                    candidate = evaluate_flat(self.nodes[start : start + 4])
+                    if candidate is not None:
+                        candidates.append(candidate)
+        if include_triangles:
+            for start in range(len(self.nodes) - 5):
+                if _is_path(edge_set, start, 6):
+                    candidate = evaluate_triangle(self.nodes[start : start + 6])
+                    if candidate is not None:
+                        candidates.append(candidate)
         return sorted(
             candidates,
             key=lambda candidate: (
                 candidate.pivots[0].timestamp,
-                0 if candidate.pattern == "Impulse" else 1,
+                ("Impulse", "Triangle", "Flat", "ZigZag").index(
+                    candidate.pattern
+                ),
             ),
         )
 
@@ -91,11 +107,15 @@ def build_candidates(
     *,
     include_impulses: bool = True,
     include_zigzags: bool = True,
+    include_flats: bool = True,
+    include_triangles: bool = True,
 ) -> list[WaveCandidate]:
     """Convenience API to build the DAG and return all surviving paths."""
     return WaveDAG.from_pivots(pivots).candidates(
         include_impulses=include_impulses,
         include_zigzags=include_zigzags,
+        include_flats=include_flats,
+        include_triangles=include_triangles,
     )
 
 
@@ -172,11 +192,16 @@ def evaluate_zigzag(
 
     bearish = pivots[0].type == "High"
     sign = -1.0 if bearish else 1.0
-    b_within_origin = sign * (pivots[2].price - pivots[0].price) >= 0
+    wave_a = sign * (pivots[1].price - pivots[0].price)
+    wave_b = sign * (pivots[1].price - pivots[2].price)
+    if wave_a <= 0:
+        return None
+    b_ratio = wave_b / wave_a
+    b_within_origin = 0 <= b_ratio < 0.9
     state = RuleState(
         "wave_b_within_origin",
         b_within_origin,
-        "Wave B must not pass the origin of Wave A",
+        "Wave B must retrace less than 90% of Wave A",
     )
     if not state.passed:
         return None
@@ -187,6 +212,98 @@ def evaluate_zigzag(
         pivots=pivots,
         labels=("Start", "A", "B", "C"),
         rule_states=(state,),
+        invalidation_level=float(pivots[0].price),
+        invalidation_side="above" if bearish else "below",
+    )
+
+
+def evaluate_flat(
+    pivots: list[Pivot] | tuple[Pivot, ...],
+) -> WaveCandidate | None:
+    """Validate a deterministic regular/expanded A-B-C Flat.
+
+    Wave B must retrace at least 90% of A. Wave C's endpoint must finish
+    within 20% of Wave A's endpoint, making "near" explicit and auditable.
+    """
+    pivots = tuple(pivots)
+    if len(pivots) != 4:
+        raise ValueError("a Flat requires an origin and A, B, C endpoints")
+    _validate_pivots(pivots)
+    if not _alternates(pivots):
+        return None
+
+    bearish = pivots[0].type == "High"
+    sign = -1.0 if bearish else 1.0
+    wave_a = sign * (pivots[1].price - pivots[0].price)
+    wave_b = sign * (pivots[1].price - pivots[2].price)
+    wave_c = sign * (pivots[3].price - pivots[2].price)
+    if min(wave_a, wave_b, wave_c) <= 0:
+        return None
+    b_ratio = wave_b / wave_a
+    c_endpoint_error = abs(pivots[3].price - pivots[1].price) / wave_a
+    states = (
+        RuleState(
+            "flat_b_minimum_retracement",
+            b_ratio >= 0.9,
+            "Wave B must retrace at least 90% of Wave A",
+        ),
+        RuleState(
+            "flat_c_near_a_extreme",
+            c_endpoint_error <= 0.2,
+            "Wave C must terminate within 20% of Wave A's extreme",
+        ),
+    )
+    if not all(state.passed for state in states):
+        return None
+
+    return WaveCandidate(
+        pattern="Flat",
+        direction="Bearish" if bearish else "Bullish",
+        pivots=pivots,
+        labels=("Start", "A", "B", "C"),
+        rule_states=states,
+        invalidation_level=float(pivots[2].price),
+        invalidation_side="above" if bearish else "below",
+    )
+
+
+def evaluate_triangle(
+    pivots: list[Pivot] | tuple[Pivot, ...],
+) -> WaveCandidate | None:
+    """Validate a five-leg contracting A-B-C-D-E Triangle."""
+    pivots = tuple(pivots)
+    if len(pivots) != 6:
+        raise ValueError(
+            "a Triangle requires an origin and A, B, C, D, E endpoints"
+        )
+    _validate_pivots(pivots)
+    if not _alternates(pivots):
+        return None
+
+    lengths = tuple(
+        abs(right.price - left.price)
+        for left, right in zip(pivots, pivots[1:])
+    )
+    states = tuple(
+        RuleState(
+            f"triangle_{current_label}_contracts",
+            current < previous,
+            f"Wave {current_label} must be smaller than Wave {previous_label}",
+        )
+        for previous, current, previous_label, current_label in zip(
+            lengths, lengths[1:], ("A", "B", "C", "D"), ("B", "C", "D", "E")
+        )
+    )
+    if not all(state.passed for state in states):
+        return None
+
+    bearish = pivots[0].type == "High"
+    return WaveCandidate(
+        pattern="Triangle",
+        direction="Bearish" if bearish else "Bullish",
+        pivots=pivots,
+        labels=("Start", "A", "B", "C", "D", "E"),
+        rule_states=states,
         invalidation_level=float(pivots[0].price),
         invalidation_side="above" if bearish else "below",
     )

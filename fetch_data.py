@@ -43,3 +43,5 @@ if __name__ == "__main__":
     
     # Example 2: Bitcoin
     seed_market_data("BTC-USD", "BTC_USD.db")
+    
+    seed_market_data("RELIANCE.NS", "RELIANCE.db")

@@ -6,14 +6,16 @@ Run with:
 
 from __future__ import annotations
 
+import html
 import logging
+import sqlite3
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
 
-from db import resample_ohlcv
+from db import TIMEFRAMES, resample_ohlcv
 from engine import WaveCandidate, build_candidates
 from pivots import Pivot, extract_pivots
 from scoring import ConfidenceScore, calculate_rsi, score_candidates
@@ -123,6 +125,7 @@ def build_lightweight_charts(
     result: DashboardResult,
     overlays: tuple[bool, bool, bool],
     selected_index: int = 0,
+    alert_threshold: float = 101.0,
 ) -> list[dict[str, object]]:
     """Build synchronized TradingView Lightweight Charts specifications."""
     candles = result.candles
@@ -135,6 +138,29 @@ def build_lightweight_charts(
             "close": float(row.close),
         }
         for timestamp, row in candles.iterrows()
+    ]
+    setup_markers = [
+        {
+            "time": _chart_time(candidate.pivots[-1].timestamp),
+            "position": (
+                "belowBar" if candidate.direction == "Bullish" else "aboveBar"
+            ),
+            "shape": (
+                "arrowUp" if candidate.direction == "Bullish" else "arrowDown"
+            ),
+            "color": (
+                "#18C98B" if candidate.direction == "Bullish" else "#F05D68"
+            ),
+            "text": f"#{rank} {candidate.pattern} ({score.total:.1f})",
+        }
+        for rank, ((candidate, score), enabled) in enumerate(
+            zip(result.rankings[:3], overlays), start=1
+        )
+        if (
+            enabled
+            and _is_tradeable_setup(candidate)
+            and score.total >= alert_threshold
+        )
     ]
     price_series: list[dict[str, object]] = [
         {
@@ -150,6 +176,7 @@ def build_lightweight_charts(
                 "priceLineVisible": True,
                 "lastValueVisible": True,
             },
+            "markers": setup_markers,
         }
     ]
     for rank, ((candidate, score), enabled, color) in enumerate(
@@ -265,6 +292,144 @@ def build_lightweight_charts(
             "series": rsi_series,
         },
     ]
+
+
+def marker_status(
+    rankings: tuple[tuple[WaveCandidate, ConfidenceScore], ...],
+    overlays: tuple[bool, bool, bool],
+    alert_threshold: float,
+) -> tuple[str, str, str]:
+    """Return threshold, buy, and sell display values for visible setups."""
+    enabled = [
+        (candidate, score)
+        for (candidate, score), visible in zip(rankings[:3], overlays)
+        if visible
+    ]
+    tradeable = [
+        (candidate, score)
+        for candidate, score in enabled
+        if _is_tradeable_setup(candidate)
+    ]
+    threshold_text = f"{alert_threshold:.1f}"
+    if not enabled:
+        return threshold_text, "Overlay disabled", "Overlay disabled"
+    if not tradeable:
+        return threshold_text, "Awaiting Wave 4/B", "Awaiting Wave 4/B"
+
+    candidate, score = tradeable[0]
+    if score.total < alert_threshold:
+        message = f"Below threshold ({score.total:.1f})"
+        return threshold_text, message, message
+
+    entry = f"{candidate.pivots[-1].price:,.2f}"
+    if candidate.direction == "Bullish":
+        return threshold_text, entry, "No bearish setup"
+    return threshold_text, "No bullish setup", entry
+
+
+def system_hints(
+    candidate: WaveCandidate,
+    score: ConfidenceScore,
+    alert_threshold: float,
+    lifecycle: str,
+) -> tuple[str, ...]:
+    """Explain every gate controlling an actionable chart marker."""
+    terminal = candidate.labels[-1] if candidate.labels else "unknown"
+    target_low, target_high = target_zone(candidate)
+    invalidation_kind = (
+        "floor" if candidate.invalidation_side == "below" else "ceiling"
+    )
+    confidence = (
+        f"Confidence gate: Passed ({score.total:.1f} ≥ {alert_threshold:.1f})"
+        if score.total >= alert_threshold
+        else f"Confidence gate: Below threshold "
+        f"({score.total:.1f} < {alert_threshold:.1f})"
+    )
+    hints = [
+        f"Pattern state: {candidate.direction} {candidate.pattern} "
+        f"terminates at Wave {terminal}",
+        confidence,
+        f"Lifecycle: {lifecycle}",
+    ]
+    if lifecycle != "Active":
+        hints.extend(
+            (
+                f"Entry gate: Failed — lifecycle is {lifecycle.lower()}",
+                f"Marker decision: Hidden — setup {lifecycle.lower()}",
+                "Next required event: Wait for a new active structure "
+                "terminating at Wave 4 or Wave B",
+                "Trading interpretation: Historical structure; "
+                "not a current trade signal",
+            )
+        )
+    elif not _is_tradeable_setup(candidate):
+        required = "4" if candidate.pattern == "Impulse" else "B"
+        hints.extend(
+            (
+                f"Entry gate: Failed — candidate terminates at Wave "
+                f"{terminal}, not Wave {required}",
+                "Marker decision: Hidden — no entry setup",
+                f"Next required event: Wait for a new active Wave {required} "
+                "termination",
+                "Trading interpretation: Valid analytical structure; "
+                "not a current trade signal",
+            )
+        )
+    elif score.total < alert_threshold:
+        hints.extend(
+            (
+                "Entry gate: Passed — terminal Wave 4/B is present",
+                "Marker decision: Hidden — confidence gate not met",
+                f"Next required event: Confidence must reach "
+                f"{alert_threshold:.1f}",
+                "Trading interpretation: Structurally actionable but "
+                "insufficiently ranked",
+            )
+        )
+    else:
+        side = "Buy" if candidate.direction == "Bullish" else "Sell"
+        hints.extend(
+            (
+                "Entry gate: Passed — terminal Wave 4/B is present",
+                f"Marker decision: Visible — {side} at "
+                f"{candidate.pivots[-1].price:,.2f}",
+                "Next required event: Monitor target and invalidation",
+                f"Trading interpretation: Actionable {side.lower()} setup",
+            )
+        )
+    hints.extend(
+        (
+            f"Invalidation reference: {candidate.invalidation_level:,.2f} "
+            f"{invalidation_kind}",
+            f"Target zone: {target_low:,.2f}–{target_high:,.2f}",
+        )
+    )
+    return tuple(hints)
+
+
+def _format_hint_value(value: str) -> str:
+    """Color only explicit decision terms; keep supporting detail white."""
+    formatted = html.escape(value)
+    negative = (
+        "not a current trade signal",
+        "insufficiently ranked",
+        "Below threshold",
+        "Invalidated",
+        "Failed",
+        "Hidden",
+    )
+    positive = ("Actionable", "actionable", "Passed", "Visible")
+    for term in negative:
+        formatted = formatted.replace(
+            term,
+            f"<strong style='color:#F05D68'>{term}</strong>",
+        )
+    for term in positive:
+        formatted = formatted.replace(
+            term,
+            f"<strong style='color:#18C98B'>{term}</strong>",
+        )
+    return formatted
 
 
 def _chart_options(
@@ -482,16 +647,9 @@ def _inject_terminal_css(st) -> None:
     )
 
 
-def main() -> None:
+def _render_single_chart() -> None:
     import streamlit as st
     from streamlit_lightweight_charts import renderLightweightCharts
-
-    st.set_page_config(
-        page_title="Deterministic Elliott Wave DSS",
-        layout="wide",
-        initial_sidebar_state="collapsed",
-    )
-    _inject_terminal_css(st)
 
     databases = discover_databases()
     title_col, status_col = st.columns([0.75, 0.25], vertical_alignment="center")
@@ -523,16 +681,25 @@ def main() -> None:
             disabled=not databases,
         )
     with timeframe_col:
-        timeframe = st.selectbox("Timeframe", ("1H", "4H"))
+        timeframe_options = tuple(TIMEFRAMES)
+        timeframe = st.selectbox(
+            "Timeframe",
+            timeframe_options,
+            index=timeframe_options.index("1H"),
+        )
     with pattern_col:
         pattern_view = st.selectbox(
             "Pattern View",
             ("Balanced · 1–5 + ABC", "Impulse · 1–5", "ZigZag · ABC"),
         )
     with multiplier_col:
-        atr_multiplier = st.slider("ATR Multiplier", 1.5, 4.0, 2.0, 0.1)
+        atr_multiplier = st.slider(
+            "ATR Multiplier", 1.5, 4.0, 2.0, 0.1, key="atr_multiplier"
+        )
     with period_col:
-        atr_period = st.slider("ATR Period", 5, 50, 14, 1)
+        atr_period = st.slider(
+            "ATR Period", 5, 50, 14, 1, key="atr_period"
+        )
     with universe_col:
         candidate_scope = st.selectbox(
             "Candidate Scope", ("Actionable", "Recent · 30D", "All history")
@@ -591,6 +758,7 @@ def main() -> None:
         "DATA THROUGH", result.candles.index[-1].strftime("%d %b · %H:%M UTC")
     )
 
+    alert_threshold = float(st.session_state.get("alert_threshold", 75))
     chart_col, inspector_col = st.columns([0.78, 0.22], gap="medium")
     top_rankings = scoped_rankings[:3]
     with inspector_col:
@@ -671,6 +839,33 @@ def main() -> None:
                 """,
                 unsafe_allow_html=True,
             )
+            hints = system_hints(
+                candidate, score, alert_threshold, lifecycle
+            )
+            hint_rows = []
+            for hint in hints:
+                label, separator, value = hint.partition(":")
+                if not separator:
+                    label, value = "Status", hint
+                hint_rows.append(
+                    "<tr>"
+                    "<td style='color:#F4F7FA;font-weight:700;"
+                    "font-size:.71rem;vertical-align:top;padding:.3rem .7rem "
+                    f".3rem 0;white-space:nowrap'>{html.escape(label)}</td>"
+                    "<td style='color:#F4F7FA;font-size:.71rem;"
+                    "line-height:1.35;padding:.3rem 0'>"
+                    f"{_format_hint_value(value.strip())}</td>"
+                    "</tr>"
+                )
+            st.markdown(
+                "<div class='terminal-panel'>"
+                "<div class='terminal-kicker'>System Hints</div>"
+                "<table style='width:100%;border-collapse:collapse;"
+                "border:0;margin-top:.35rem'><tbody>"
+                + "".join(hint_rows)
+                + "</tbody></table></div>",
+                unsafe_allow_html=True,
+            )
             focus_selected = st.checkbox(
                 "Focus chart on selected path", value=True
             )
@@ -689,6 +884,21 @@ def main() -> None:
                     )
 
     with chart_col:
+        threshold_text, buy_text, sell_text = marker_status(
+            view_result.rankings, overlays, alert_threshold
+        )
+        st.markdown(
+            "<div class='terminal-panel' style='display:grid;"
+            "grid-template-columns:repeat(3,1fr);gap:.8rem;margin-bottom:.7rem'>"
+            "<div><span class='terminal-kicker'>Marker threshold</span>"
+            f"<div class='terminal-value'>{threshold_text}</div></div>"
+            "<div><span class='terminal-kicker'>Buy at</span>"
+            f"<div class='terminal-value' style='color:#18C98B'>{buy_text}</div></div>"
+            "<div><span class='terminal-kicker'>Sell at</span>"
+            f"<div class='terminal-value' style='color:#F05D68'>{sell_text}</div></div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
         chart_result = (
             focus_dashboard(view_result, top_rankings[selected_index][0])
             if top_rankings and focus_selected
@@ -696,12 +906,15 @@ def main() -> None:
         )
         renderLightweightCharts(
             build_lightweight_charts(
-                chart_result, overlays, selected_index=selected_index
+                chart_result,
+                overlays,
+                selected_index=selected_index,
+                alert_threshold=alert_threshold,
             ),
             key=(
                 f"elliott-{selected_database.name}-{timeframe}-"
                 f"{candidate_scope}-{selected_index}-{overlays}-"
-                f"{bool(top_rankings and focus_selected)}"
+                f"{bool(top_rankings and focus_selected)}-{alert_threshold}"
             ),
         )
 
@@ -745,7 +958,7 @@ def main() -> None:
             )
             chat_id = st.text_input("Telegram Chat ID")
             alert_threshold = st.slider(
-                "Alert Confidence Score", 0, 100, 75
+                "Alert Confidence Score", 0, 100, 75, key="alert_threshold"
             )
             st.caption("Log-only webhook shell. No network request is sent.")
             if scoped_rankings:
@@ -765,6 +978,171 @@ def main() -> None:
                     log_alert_background(alert)
                     st.session_state["last_alert_key"] = alert_key
                     st.success("Setup written to application logs.")
+
+
+def _is_tradeable_setup(candidate: WaveCandidate) -> bool:
+    """Whether the terminal pivot is the actionable Wave 4 or Wave B."""
+    return bool(candidate.labels) and candidate.labels[-1] in {"4", "B"}
+
+
+def _has_completed_trade_setup(candidate: WaveCandidate) -> bool:
+    """Backward-compatible alias for the shared tradeability predicate."""
+    return _is_tradeable_setup(candidate)
+
+
+def scan_global_markets(
+    databases: tuple[Path, ...],
+    atr_multiplier: float,
+    atr_period: int,
+) -> tuple[pd.DataFrame, tuple[str, ...]]:
+    """Scan every asset/timeframe without mutating terminal state."""
+    rows: list[dict[str, object]] = []
+    errors: list[str] = []
+    handled_errors = (
+        ValueError,
+        OSError,
+        sqlite3.DatabaseError,
+        pd.errors.DatabaseError,
+        ZeroDivisionError,
+    )
+    for database in databases:
+        for timeframe in TIMEFRAMES:
+            try:
+                result = compute_dashboard(
+                    database, timeframe, atr_multiplier, atr_period
+                )
+            except handled_errors as error:
+                errors.append(f"{database.name} {timeframe}: {error}")
+                continue
+            for candidate, score in result.rankings:
+                if not _has_completed_trade_setup(candidate):
+                    continue
+                if candidate_lifecycle(candidate, result.candles) != "Active":
+                    continue
+                target_low, target_high = target_zone(candidate)
+                rows.append(
+                    {
+                        "Market": database.stem,
+                        "Timeframe": timeframe,
+                        "Pattern": candidate.pattern,
+                        "Direction": candidate.direction,
+                        "Confidence Score": score.total,
+                        "Invalidation Price": candidate.invalidation_level,
+                        "Fibonacci Target Zone": (
+                            f"{target_low:,.5f} – {target_high:,.5f}"
+                        ),
+                    }
+                )
+    columns = (
+        "Market",
+        "Timeframe",
+        "Pattern",
+        "Direction",
+        "Confidence Score",
+        "Invalidation Price",
+        "Fibonacci Target Zone",
+    )
+    frame = pd.DataFrame(rows, columns=columns)
+    if not frame.empty:
+        frame = frame.sort_values(
+            "Confidence Score", ascending=False, kind="stable"
+        ).reset_index(drop=True)
+    return frame, tuple(errors)
+
+
+def _render_global_scanner() -> None:
+    import streamlit as st
+
+    st.markdown("## Global Market Scanner")
+    st.caption(
+        "Batch scan of every local market across every registered timeframe. "
+        "Only active structures with a completed Wave 4 or Wave B are shown."
+    )
+    atr_multiplier = float(st.session_state.get("atr_multiplier", 2.0))
+    atr_period = int(st.session_state.get("atr_period", 14))
+    databases = discover_databases()
+
+    status_col, action_col = st.columns([0.75, 0.25], vertical_alignment="center")
+    with status_col:
+        st.markdown(
+            f"<div class='terminal-panel'><span class='terminal-kicker'>"
+            f"Scan universe</span><div class='terminal-value'>"
+            f"{len(databases)} markets · {len(TIMEFRAMES)} timeframes · ATR "
+            f"{atr_period} × {atr_multiplier:.1f}</div></div>",
+            unsafe_allow_html=True,
+        )
+    with action_col:
+        run_scan = st.button(
+            "Run market scan",
+            type="primary",
+            width="stretch",
+            disabled=not databases,
+        )
+
+    if not databases:
+        st.info("No local asset databases were detected.")
+        return
+    if run_scan:
+        with st.spinner("Scanning markets..."):
+            frame, errors = scan_global_markets(
+                databases, atr_multiplier, atr_period
+            )
+        st.session_state["scanner_frame"] = frame
+        st.session_state["scanner_errors"] = errors
+        st.session_state["scanner_signature"] = (
+            tuple(str(path) for path in databases),
+            atr_multiplier,
+            atr_period,
+        )
+
+    frame = st.session_state.get("scanner_frame")
+    errors = st.session_state.get("scanner_errors", ())
+    if frame is None:
+        st.info("Run the scanner to calculate the current global opportunity set.")
+        return
+    if frame.empty:
+        st.warning("No active Wave 4 or Wave B trade setups were found.")
+    else:
+        st.dataframe(
+            frame,
+            hide_index=True,
+            width="stretch",
+            height=min(680, 44 + 35 * len(frame)),
+            column_config={
+                "Confidence Score": st.column_config.NumberColumn(
+                    format="%.2f"
+                ),
+                "Invalidation Price": st.column_config.NumberColumn(
+                    format="%.5f"
+                ),
+            },
+        )
+        st.caption(
+            f"{len(frame)} active setups · sorted by Confidence Score"
+        )
+    if errors:
+        with st.expander(f"Skipped inputs ({len(errors)})", expanded=False):
+            for error in errors:
+                st.caption(error)
+
+
+def main() -> None:
+    import streamlit as st
+
+    st.set_page_config(
+        page_title="Deterministic Elliott Wave DSS",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
+    _inject_terminal_css(st)
+    terminal_tab, scanner_tab = st.tabs(
+        ("Single Chart Terminal", "Global Market Scanner"),
+        key="dashboard_view",
+    )
+    with terminal_tab:
+        _render_single_chart()
+    with scanner_tab:
+        _render_global_scanner()
 
 
 if __name__ == "__main__":

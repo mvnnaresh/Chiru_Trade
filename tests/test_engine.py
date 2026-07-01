@@ -3,7 +3,14 @@ from dataclasses import FrozenInstanceError
 import pandas as pd
 import pytest
 
-from engine import WaveDAG, build_candidates, evaluate_impulse, evaluate_zigzag
+from engine import (
+    WaveDAG,
+    build_candidates,
+    evaluate_flat,
+    evaluate_impulse,
+    evaluate_triangle,
+    evaluate_zigzag,
+)
 from pivots import Pivot
 
 
@@ -117,6 +124,88 @@ def test_abc_is_pruned_when_b_passes_a_origin():
     )
 
     assert evaluate_zigzag(path) is None
+
+
+def test_valid_expanded_flat_has_labels_rules_and_b_invalidation():
+    path = (
+        pivot(0, 120, "High"),
+        pivot(5, 100, "Low"),
+        pivot(10, 121, "High"),
+        pivot(15, 101, "Low"),
+    )
+
+    candidate = evaluate_flat(path)
+
+    assert candidate is not None
+    assert candidate.pattern == "Flat"
+    assert candidate.labels == ("Start", "A", "B", "C")
+    assert all(state.passed for state in candidate.rule_states)
+    assert candidate.invalidation_level == 121
+    assert candidate.invalidation_side == "above"
+
+
+@pytest.mark.parametrize(
+    "prices",
+    [
+        (120, 100, 117, 101),  # B retraces only 85% of A
+        (120, 100, 121, 110),  # C terminates too far from A's extreme
+    ],
+)
+def test_flat_rules_prune_invalid_paths(prices):
+    kinds = ("High", "Low", "High", "Low")
+    path = tuple(
+        pivot(index * 5, price, kind)
+        for index, (price, kind) in enumerate(zip(prices, kinds))
+    )
+
+    assert evaluate_flat(path) is None
+
+
+def test_valid_contracting_triangle_has_abcde_labels_and_invalidation():
+    path = (
+        pivot(0, 120, "High"),
+        pivot(5, 100, "Low"),
+        pivot(10, 114, "High"),
+        pivot(15, 104, "Low"),
+        pivot(20, 111, "High"),
+        pivot(25, 106, "Low"),
+    )
+
+    candidate = evaluate_triangle(path)
+
+    assert candidate is not None
+    assert candidate.pattern == "Triangle"
+    assert candidate.labels == ("Start", "A", "B", "C", "D", "E")
+    assert len(candidate.rule_states) == 4
+    assert candidate.invalidation_level == 120
+    assert candidate.invalidation_side == "above"
+
+
+def test_triangle_is_pruned_when_any_leg_stops_contracting():
+    path = (
+        pivot(0, 120, "High"),
+        pivot(5, 100, "Low"),
+        pivot(10, 114, "High"),
+        pivot(15, 104, "Low"),
+        pivot(20, 111, "High"),
+        pivot(25, 103, "Low"),  # E=8 exceeds D=7
+    )
+
+    assert evaluate_triangle(path) is None
+
+
+def test_builder_integrates_flat_and_triangle_patterns():
+    triangle = [
+        pivot(0, 120, "High"),
+        pivot(5, 100, "Low"),
+        pivot(10, 114, "High"),
+        pivot(15, 104, "Low"),
+        pivot(20, 111, "High"),
+        pivot(25, 106, "Low"),
+    ]
+    patterns = {candidate.pattern for candidate in build_candidates(triangle)}
+
+    assert "Triangle" in patterns
 
 
 def test_builder_returns_both_pattern_types_from_graph_paths():

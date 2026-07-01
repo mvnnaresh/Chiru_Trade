@@ -65,10 +65,14 @@ def score_candidates(
         raise TypeError("all candidates must be WaveCandidate objects")
 
     rsi = calculate_rsi(ohlcv, period=rsi_period)
+    scorers = {
+        "Impulse": _score_impulse,
+        "ZigZag": _score_zigzag,
+        "Flat": _score_flat,
+        "Triangle": _score_triangle,
+    }
     scores = {
-        candidate: _score_impulse(candidate, rsi)
-        if candidate.pattern == "Impulse"
-        else _score_zigzag(candidate, rsi)
+        candidate: scorers[candidate.pattern](candidate, rsi)
         for candidate in candidates
     }
     return MappingProxyType(scores)
@@ -205,6 +209,161 @@ def _score_zigzag(candidate: WaveCandidate, rsi: pd.Series) -> ConfidenceScore:
             proportion_points,
             20,
             f"Wave A/C duration symmetry={time_ratio:.4f}",
+        ),
+    )
+    return _assemble_score(items)
+
+
+def _score_flat(candidate: WaveCandidate, rsi: pd.Series) -> ConfidenceScore:
+    pivots = candidate.pivots
+    sign = 1.0 if candidate.direction == "Bullish" else -1.0
+    wave_a = sign * (pivots[1].price - pivots[0].price)
+    wave_b = sign * (pivots[1].price - pivots[2].price)
+    wave_c = sign * (pivots[3].price - pivots[2].price)
+    b_ratio = wave_b / wave_a
+    c_ratio = wave_c / wave_a
+    b_points = _range_alignment(b_ratio, 1.0, 1.05, 0.1, 30)
+    c_points = _target_alignment(c_ratio, (1.0,), 0.25, 20)
+
+    a_strength = _wave_momentum(
+        rsi, pivots[0].timestamp, pivots[1].timestamp, sign
+    )
+    c_strength = _wave_momentum(
+        rsi, pivots[2].timestamp, pivots[3].timestamp, sign
+    )
+    c_confirms = (
+        a_strength is not None
+        and c_strength is not None
+        and c_strength >= a_strength
+    )
+    c_extends = sign * (pivots[3].price - pivots[1].price) > 0
+    c_diverges = (
+        a_strength is not None
+        and c_strength is not None
+        and c_extends
+        and c_strength < a_strength
+    )
+    confirmation_points = 20.0 if c_confirms else 0.0
+    divergence_points = 10.0 if c_diverges else 0.0
+
+    duration_a = (pivots[1].timestamp - pivots[0].timestamp).total_seconds()
+    duration_c = (pivots[3].timestamp - pivots[2].timestamp).total_seconds()
+    duration_symmetry = min(duration_a, duration_c) / max(duration_a, duration_c)
+    duration_points = 10.0 * duration_symmetry
+    leg_balance = min(wave_b, wave_c) / max(wave_b, wave_c)
+    balance_points = 10.0 * leg_balance
+    items = (
+        ScoreItem(
+            "Fibonacci Alignment",
+            b_points,
+            30,
+            f"Flat Wave B/A={b_ratio:.4f}; ideal expanded range=1.000-1.050",
+        ),
+        ScoreItem(
+            "Fibonacci Alignment",
+            c_points,
+            20,
+            f"Flat Wave C/A={c_ratio:.4f}; regular-flat target=1.000",
+        ),
+        ScoreItem(
+            "Momentum Verification",
+            confirmation_points,
+            20,
+            "Wave C RSI strength confirms Wave A"
+            if c_confirms
+            else "Wave C lacks RSI confirmation versus Wave A",
+        ),
+        ScoreItem(
+            "Momentum Verification",
+            divergence_points,
+            10,
+            "Extended Wave C shows RSI divergence"
+            if c_diverges
+            else "No qualifying extended Wave C divergence",
+        ),
+        ScoreItem(
+            "Channeling & Alternation",
+            duration_points,
+            10,
+            f"Wave A/C duration symmetry={duration_symmetry:.4f}",
+        ),
+        ScoreItem(
+            "Channeling & Alternation",
+            balance_points,
+            10,
+            f"Wave B/C price-leg balance={leg_balance:.4f}",
+        ),
+    )
+    return _assemble_score(items)
+
+
+def _score_triangle(candidate: WaveCandidate, rsi: pd.Series) -> ConfidenceScore:
+    pivots = candidate.pivots
+    lengths = tuple(
+        abs(right.price - left.price)
+        for left, right in zip(pivots, pivots[1:])
+    )
+    ratios = tuple(
+        current / previous
+        for previous, current in zip(lengths, lengths[1:])
+    )
+    contraction_items = tuple(
+        ScoreItem(
+            "Fibonacci Alignment",
+            _range_alignment(ratio, 0.5, 0.8, 0.2, 12.5),
+            12.5,
+            f"Triangle {label} contraction ratio={ratio:.4f}",
+        )
+        for ratio, label in zip(ratios, ("B/A", "C/B", "D/C", "E/D"))
+    )
+
+    strengths = tuple(
+        _wave_momentum(
+            rsi,
+            left.timestamp,
+            right.timestamp,
+            1.0 if right.price > left.price else -1.0,
+        )
+        for left, right in zip(pivots, pivots[1:])
+    )
+    momentum_points = sum(
+        7.5
+        for previous, current in zip(strengths, strengths[1:])
+        if previous is not None and current is not None and current < previous
+    )
+
+    highs = [pivot.price for pivot in pivots if pivot.type == "High"]
+    lows = [pivot.price for pivot in pivots if pivot.type == "Low"]
+    highs_contract = all(
+        current < previous for previous, current in zip(highs, highs[1:])
+    )
+    lows_contract = all(
+        current > previous for previous, current in zip(lows, lows[1:])
+    )
+    wedge_points = 15.0 if highs_contract and lows_contract else 0.0
+    mean_ratio = sum(ratios) / len(ratios)
+    mean_deviation = sum(abs(ratio - mean_ratio) for ratio in ratios) / len(ratios)
+    symmetry_points = max(0.0, 5.0 * (1.0 - mean_deviation / 0.2))
+    items = contraction_items + (
+        ScoreItem(
+            "Momentum Verification",
+            momentum_points,
+            30,
+            f"{int(momentum_points / 7.5)}/4 consecutive legs show declining RSI",
+        ),
+        ScoreItem(
+            "Channeling & Alternation",
+            wedge_points,
+            15,
+            "Upper highs descend and lower lows ascend in a contracting wedge"
+            if wedge_points
+            else "Pivot boundaries do not form a clean contracting wedge",
+        ),
+        ScoreItem(
+            "Channeling & Alternation",
+            symmetry_points,
+            5,
+            f"Contraction-ratio mean deviation={mean_deviation:.4f}",
         ),
     )
     return _assemble_score(items)
