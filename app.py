@@ -16,12 +16,24 @@ from pathlib import Path
 import pandas as pd
 
 from db import TIMEFRAMES, resample_ohlcv
-from engine import WaveCandidate, build_candidates, find_provisional_candidates
+from engine import (
+    WaveCandidate,
+    build_candidates,
+    find_provisional_candidates,
+    select_active_primary,
+)
+from market_data import append_latest_m5, resolve_market_symbol
 from pivots import Pivot, PivotState, extract_pivot_state
 from scoring import ConfidenceScore, calculate_rsi, score_candidates
 
 LOGGER = logging.getLogger("elliott_dashboard")
 COLORS = ("#00D4FF", "#FFB000", "#D65CFF")
+SENSITIVITY_PRESETS: dict[str, tuple[float, int]] = {
+    "Tight": (1.8, 10),
+    "Balanced": (2.0, 14),
+    "Conservative": (2.6, 21),
+}
+LIVE_REFRESH_SECONDS: dict[str, int] = {"15s": 15, "30s": 30, "60s": 60}
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +43,60 @@ class DashboardResult:
     rankings: tuple[tuple[WaveCandidate, ConfidenceScore], ...]
     rsi: pd.Series
     pivot_state: PivotState | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecommendationState:
+    action: str
+    color: str
+    entry_text: str
+    stop_text: str
+    target_text: str
+    status_text: str
+    rationale: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LiveRefreshState:
+    checked_at: pd.Timestamp
+    rows_added: int
+    last_completed_bar: pd.Timestamp | None
+    ok: bool
+    message: str
+
+
+def resolve_sensitivity(
+    preset: str,
+    *,
+    override_enabled: bool = False,
+    atr_multiplier: float | None = None,
+    atr_period: int | None = None,
+) -> tuple[float, int]:
+    """Resolve trader-facing sensitivity into deterministic ATR settings."""
+    if preset not in SENSITIVITY_PRESETS:
+        raise ValueError(f"unknown sensitivity preset: {preset}")
+    base_multiplier, base_period = SENSITIVITY_PRESETS[preset]
+    if not override_enabled:
+        return base_multiplier, base_period
+    resolved_multiplier = (
+        float(atr_multiplier) if atr_multiplier is not None else base_multiplier
+    )
+    resolved_period = int(atr_period) if atr_period is not None else base_period
+    return resolved_multiplier, resolved_period
+
+
+def system_status(
+    *,
+    live_enabled: bool,
+    live_supported: bool,
+    live_refresh_ok: bool | None = None,
+) -> tuple[str, str]:
+    """Return a deterministic terminal status label and color."""
+    if not live_enabled or not live_supported:
+        return "SYSTEM OFFLINE", "#F0B90B"
+    if live_refresh_ok is False:
+        return "SYSTEM OFFLINE", "#F05D68"
+    return "SYSTEM LIVE", "#18C98B"
 
 
 def discover_databases(directory: str | Path = ".") -> tuple[Path, ...]:
@@ -43,6 +109,45 @@ def discover_databases(directory: str | Path = ".") -> tuple[Path, ...]:
         if path.is_file()
     }
     return tuple(sorted(files, key=lambda path: path.name.lower()))
+
+
+def refresh_live_database(
+    database: str | Path,
+    *,
+    lookback_period: str = "5d",
+) -> str:
+    """Append the latest completed Yahoo M5 candles and summarize the refresh."""
+    state = refresh_live_database_state(database, lookback_period=lookback_period)
+    return state.message
+
+
+def refresh_live_database_state(
+    database: str | Path,
+    *,
+    lookback_period: str = "5d",
+) -> LiveRefreshState:
+    """Append latest completed Yahoo M5 candles and return auditable refresh state."""
+    checked_at = pd.Timestamp.now(tz="UTC")
+    inserted, last_completed = append_latest_m5(database, period=lookback_period)
+    message = (
+        f"Yahoo live | completed M5 through "
+        f"{last_completed.strftime('%d %b %H:%M UTC')} | +{inserted} rows"
+    )
+    return LiveRefreshState(
+        checked_at=checked_at,
+        rows_added=int(inserted),
+        last_completed_bar=pd.Timestamp(last_completed),
+        ok=True,
+        message=message,
+    )
+
+
+def _offset_timestamp(timestamp: pd.Timestamp, timeframe: str) -> pd.Timestamp:
+    """Convert a left-labeled candle timestamp to its completed-through time."""
+    spec = TIMEFRAMES[timeframe.upper()]
+    return pd.Timestamp(timestamp) + pd.tseries.frequencies.to_offset(
+        spec.pandas_rule
+    )
 
 
 def compute_dashboard(
@@ -113,15 +218,12 @@ def format_setup_alert(
     chat_id: str,
 ) -> str | None:
     """Build an alert only for a newly completed Wave 4 or Wave B setup."""
-    if (
-        score.total < threshold
-        or not _is_tradeable_setup(candidate)
-    ):
+    if score.total < threshold or not _is_tradeable_setup(candidate):
         return None
     low, high = target_zone(candidate)
     return (
         f"Elliott setup | chat={chat_id or 'unset'} | "
-        f"{candidate.pattern} {candidate.direction} | "
+        f"{candidate.pattern} | {candidate.direction} | "
         f"Confidence Score={score.total:.2f}/100 | "
         f"Invalidation={candidate.invalidation_level:.5f} | "
         f"Target zone={low:.5f}-{high:.5f}"
@@ -248,7 +350,7 @@ def build_lightweight_charts(
                     "lineStyle": 2 if candidate.status == "Forming" else 0,
                     "priceLineVisible": False,
                     "lastValueVisible": False,
-                    "title": f"#{rank} {candidate.pattern} · {candidate.status}",
+                    "title": _series_title(rank, candidate),
                 },
                 "markers": wave_markers if rank - 1 == selected_index else [],
             }
@@ -257,32 +359,7 @@ def build_lightweight_charts(
     if result.rankings:
         selected_index = min(selected_index, len(result.rankings) - 1)
         selected_candidate = result.rankings[selected_index][0]
-        setup_timestamp, _setup_price = _setup_endpoint(selected_candidate)
-        first_time = _chart_time(setup_timestamp)
-        last_time = _chart_time(candles.index[-1])
-        target_low, target_high = target_zone(selected_candidate)
-        for price, color, title in (
-            (selected_candidate.invalidation_level, "#F05D68", "Invalidation"),
-            (target_low, "#18C98B", "Target 1.000"),
-            (target_high, "#00BFA5", "Target 1.618"),
-        ):
-            price_series.append(
-                {
-                    "type": "Line",
-                    "data": [
-                        {"time": first_time, "value": price},
-                        {"time": last_time, "value": price},
-                    ],
-                    "options": {
-                        "color": color,
-                        "lineWidth": 1,
-                        "lineStyle": 2,
-                        "priceLineVisible": False,
-                        "lastValueVisible": False,
-                        "title": "",
-                    },
-                }
-            )
+        price_series.extend(_reference_line_specs(selected_candidate, candles))
 
     rsi_data = [
         {"time": _chart_time(timestamp), "value": float(value)}
@@ -371,6 +448,110 @@ def marker_status(
     return threshold_text, "No bullish setup", entry
 
 
+def trader_recommendation(
+    candidate: WaveCandidate | None,
+    score: ConfidenceScore | None,
+    alert_threshold: float,
+    lifecycle: str | None,
+) -> RecommendationState:
+    """Return a trader-facing recommendation derived from existing deterministic gates."""
+    if candidate is None or score is None or lifecycle is None:
+        return RecommendationState(
+            action="NO TRADE",
+            color="#F0B90B",
+            entry_text="n/a",
+            stop_text="n/a",
+            target_text="n/a",
+            status_text="No active candidate selected",
+            rationale=(
+                "No candidate is currently selected.",
+                "Use the inspector to choose a live structure.",
+            ),
+        )
+
+    target_low, target_high = target_zone(candidate)
+    stop_text = f"{candidate.invalidation_level:,.2f}"
+    target_text = f"{target_low:,.2f} - {target_high:,.2f}"
+
+    if candidate.status == "Forming":
+        return RecommendationState(
+            action="WATCH",
+            color="#F0B90B",
+            entry_text="Await confirmation",
+            stop_text=stop_text,
+            target_text=target_text,
+            status_text=f"Forming Wave {candidate.forming_label}",
+            rationale=(
+                "The terminal pivot is still forming.",
+                "Wait for the Wave 4/B endpoint to confirm.",
+            ),
+        )
+    if lifecycle != "Active":
+        return RecommendationState(
+            action="NO TRADE",
+            color="#F05D68",
+            entry_text="n/a",
+            stop_text=stop_text,
+            target_text=target_text,
+            status_text=f"Structure lifecycle is {lifecycle.lower()}",
+            rationale=(
+                "The selected structure is no longer live.",
+                "Wait for a new active Wave 4/B setup.",
+            ),
+        )
+    if not _is_tradeable_setup(candidate):
+        required = "Wave 4" if candidate.pattern == "Impulse" else "Wave B"
+        return RecommendationState(
+            action="NO TRADE",
+            color="#F05D68",
+            entry_text="n/a",
+            stop_text=stop_text,
+            target_text=target_text,
+            status_text=f"Awaiting {required}",
+            rationale=(
+                "This structure is valid but not at the tradeable terminal wave.",
+                f"Wait for a fresh {required} setup.",
+            ),
+        )
+    if score.total < alert_threshold:
+        return RecommendationState(
+            action="WATCH",
+            color="#F0B90B",
+            entry_text=f"{candidate.pivots[-1].price:,.2f}",
+            stop_text=stop_text,
+            target_text=target_text,
+            status_text=f"Below confidence threshold ({score.total:.1f} < {alert_threshold:.1f})",
+            rationale=(
+                "The structure is tradeable but not ranked high enough.",
+                "Wait for stronger confirmation before acting.",
+            ),
+        )
+    side = "BUY" if candidate.direction == "Bullish" else "SELL"
+    return RecommendationState(
+        action=side,
+        color="#18C98B" if side == "BUY" else "#F05D68",
+        entry_text=f"{candidate.pivots[-1].price:,.2f}",
+        stop_text=stop_text,
+        target_text=target_text,
+        status_text=f"{candidate.pattern} | {current_wave_label(candidate)}",
+        rationale=(
+            "Terminal Wave 4/B is present and active.",
+            "Confidence gate is passed.",
+        ),
+    )
+
+
+def pattern_state_text(candidate: WaveCandidate) -> str:
+    """Return a trader-facing summary of the structure's current state."""
+    if candidate.status == "Forming" and candidate.forming_label is not None:
+        return (
+            f"{candidate.direction} {candidate.pattern} is currently "
+            f"forming Wave {candidate.forming_label}"
+        )
+    terminal = candidate.labels[-1] if candidate.labels else "unknown"
+    return f"{candidate.direction} {candidate.pattern} through Wave {terminal}"
+
+
 def system_hints(
     candidate: WaveCandidate,
     score: ConfidenceScore,
@@ -384,22 +565,30 @@ def system_hints(
         "floor" if candidate.invalidation_side == "below" else "ceiling"
     )
     confidence = (
-        f"Confidence gate: Passed ({score.total:.1f} ≥ {alert_threshold:.1f})"
+        f"Confidence gate: Passed ({score.total:.1f} >= {alert_threshold:.1f})"
         if score.total >= alert_threshold
         else f"Confidence gate: Below threshold "
         f"({score.total:.1f} < {alert_threshold:.1f})"
     )
     hints = [
-        f"Pattern state: {candidate.direction} {candidate.pattern} "
-        f"terminates at Wave {terminal}",
+        f"Pattern state: {pattern_state_text(candidate)}",
+        f"Current wave: {current_wave_label(candidate)}",
         confidence,
         f"Lifecycle: {lifecycle}",
     ]
+    wave_three = wave_three_window(candidate)
+    if wave_three is not None:
+        hints.extend(
+            (
+                _format_wave_point(wave_three[0]),
+                _format_wave_point(wave_three[1]),
+            )
+        )
     if candidate.status == "Forming":
         hints.extend(
             (
-                "Entry gate: Pending — Wave 4/B endpoint is not confirmed",
-                "Marker decision: Hidden — forming structures are watch-only",
+                "Entry gate: Pending - Wave 4/B endpoint is not confirmed",
+                "Marker decision: Hidden - forming structures are watch-only",
                 f"Next required event: Confirm the provisional Wave "
                 f"{candidate.forming_label} pivot",
                 "Trading interpretation: Watchlist candidate; "
@@ -409,8 +598,8 @@ def system_hints(
     elif lifecycle != "Active":
         hints.extend(
             (
-                f"Entry gate: Failed — lifecycle is {lifecycle.lower()}",
-                f"Marker decision: Hidden — setup {lifecycle.lower()}",
+                f"Entry gate: Failed - lifecycle is {lifecycle.lower()}",
+                f"Marker decision: Hidden - setup {lifecycle.lower()}",
                 "Next required event: Wait for a new active structure "
                 "terminating at Wave 4 or Wave B",
                 "Trading interpretation: Historical structure; "
@@ -421,9 +610,9 @@ def system_hints(
         required = "4" if candidate.pattern == "Impulse" else "B"
         hints.extend(
             (
-                f"Entry gate: Failed — candidate terminates at Wave "
+                f"Entry gate: Failed - candidate terminates at Wave "
                 f"{terminal}, not Wave {required}",
-                "Marker decision: Hidden — no entry setup",
+                "Marker decision: Hidden - no entry setup",
                 f"Next required event: Wait for a new active Wave {required} "
                 "termination",
                 "Trading interpretation: Valid analytical structure; "
@@ -433,8 +622,8 @@ def system_hints(
     elif score.total < alert_threshold:
         hints.extend(
             (
-                "Entry gate: Passed — terminal Wave 4/B is present",
-                "Marker decision: Hidden — confidence gate not met",
+                "Entry gate: Passed - terminal Wave 4/B is present",
+                "Marker decision: Hidden - confidence gate not met",
                 f"Next required event: Confidence must reach "
                 f"{alert_threshold:.1f}",
                 "Trading interpretation: Structurally actionable but "
@@ -445,8 +634,8 @@ def system_hints(
         side = "Buy" if candidate.direction == "Bullish" else "Sell"
         hints.extend(
             (
-                "Entry gate: Passed — terminal Wave 4/B is present",
-                f"Marker decision: Visible — {side} at "
+                "Entry gate: Passed - terminal Wave 4/B is present",
+                f"Marker decision: Visible - {side} at "
                 f"{candidate.pivots[-1].price:,.2f}",
                 "Next required event: Monitor target and invalidation",
                 f"Trading interpretation: Actionable {side.lower()} setup",
@@ -456,11 +645,10 @@ def system_hints(
         (
             f"Invalidation reference: {candidate.invalidation_level:,.2f} "
             f"{invalidation_kind}",
-            f"Target zone: {target_low:,.2f}–{target_high:,.2f}",
+            f"Target zone: {target_low:,.2f} - {target_high:,.2f}",
         )
     )
     return tuple(hints)
-
 
 def _format_hint_value(value: str) -> str:
     """Color only explicit decision terms; keep supporting detail white."""
@@ -559,6 +747,157 @@ def _candidate_name(index: int, candidate: WaveCandidate, score: ConfidenceScore
     )
 
 
+def _candidate_query_key(candidate: WaveCandidate) -> str:
+    """Return a stable query-string key for the currently selected candidate."""
+    labels = ",".join(candidate.labels)
+    pivots = ",".join(
+        pivot.timestamp.tz_convert("UTC").strftime("%Y%m%d%H%M%S")
+        for pivot in candidate.pivots
+    )
+    return f"{candidate.pattern}|{candidate.direction}|{candidate.status}|{labels}|{pivots}"
+
+
+def _resolve_selected_index(
+    rankings: tuple[tuple[WaveCandidate, ConfidenceScore], ...],
+    selected_key: str | None,
+) -> int:
+    if not rankings:
+        return 0
+    if not selected_key:
+        primary = select_active_primary(tuple(candidate for candidate, _ in rankings))
+        if primary is None:
+            return 0
+        for index, (candidate, _score) in enumerate(rankings):
+            if candidate == primary:
+                return index
+        return 0
+    for index, (candidate, _score) in enumerate(rankings):
+        if _candidate_query_key(candidate) == selected_key:
+            return index
+    primary = select_active_primary(tuple(candidate for candidate, _ in rankings))
+    if primary is None:
+        return 0
+    for index, (candidate, _score) in enumerate(rankings):
+        if candidate == primary:
+            return index
+    return 0
+
+
+def current_wave_label(candidate: WaveCandidate) -> str:
+    """Return the current structural wave/stage in trader-facing terms."""
+    if candidate.status == "Forming" and candidate.forming_label is not None:
+        return f"Forming Wave {candidate.forming_label}"
+    if candidate.status == "EntryReady":
+        terminal = candidate.labels[-1] if candidate.labels else "?"
+        return f"EntryReady at Wave {terminal}"
+    terminal = candidate.labels[-1] if candidate.labels else "?"
+    return f"Completed through Wave {terminal}"
+
+
+def wave_three_window(
+    candidate: WaveCandidate,
+) -> tuple[tuple[str, Pivot], tuple[str, Pivot]] | None:
+    """Return exact Wave 3 start/end pivots for impulse structures."""
+    if candidate.pattern != "Impulse":
+        return None
+    span = candidate.wave_span("2", "3")
+    if span is None:
+        return None
+    start, end = span
+    return (("Wave 3 start", start), ("Wave 3 end", end))
+
+
+def _format_wave_point(point: tuple[str, Pivot] | None) -> str:
+    if point is None:
+        return "n/a"
+    label, pivot = point
+    timestamp = pivot.timestamp.tz_convert("UTC").strftime("%d %b %Y %H:%M UTC")
+    return f"{label}: {timestamp} @ {pivot.price:,.2f}"
+
+
+def _series_title(rank: int, candidate: WaveCandidate) -> str:
+    return f"#{rank} {candidate.pattern} · {candidate.status}"
+
+
+def _reference_line_specs(
+    candidate: WaveCandidate, candles: pd.DataFrame
+) -> tuple[dict[str, object], ...]:
+    """Build consistent invalidation/target line metadata."""
+    setup_timestamp, _setup_price = _setup_endpoint(candidate)
+    first_time = _chart_time(setup_timestamp)
+    last_time = _chart_time(candles.index[-1])
+    target_low, target_high = target_zone(candidate)
+    specs = (
+        (candidate.invalidation_level, "#F05D68", "Invalidation"),
+        (target_low, "#18C98B", "Target 1.000"),
+        (target_high, "#00BFA5", "Target 1.618"),
+    )
+    return tuple(
+        {
+            "type": "Line",
+            "data": [
+                {"time": first_time, "value": price},
+                {"time": last_time, "value": price},
+            ],
+            "options": {
+                "color": color,
+                "lineWidth": 1,
+                "lineStyle": 2,
+                "priceLineVisible": False,
+                "lastValueVisible": True,
+                "title": title,
+            },
+        }
+        for price, color, title in specs
+    )
+
+
+def _legend_markup(
+    rankings: tuple[tuple[WaveCandidate, ConfidenceScore], ...],
+    overlays: tuple[bool, bool, bool],
+    selected_candidate: WaveCandidate | None,
+) -> str:
+    """Render overlay and reference legends from the same metadata as the chart."""
+    items = [
+        "<span><b style='color:#F4F7FA'>LEGEND</b></span>",
+        "<span><i style='display:inline-block;width:22px;border-top:"
+        "2px solid #00D4FF;margin-right:5px'></i>Completed</span>",
+        "<span><i style='display:inline-block;width:22px;border-top:"
+        "2px dashed #FFB000;margin-right:5px'></i>Forming</span>",
+        "<span><b style='color:#18C98B;margin-right:5px'>BUY</b>"
+        " Marker visible</span>",
+        "<span><b style='color:#F05D68;margin-right:5px'>SELL</b>"
+        " Marker visible</span>",
+    ]
+    for rank, ((candidate, score), enabled, color) in enumerate(
+        zip(rankings[:3], overlays, COLORS), start=1
+    ):
+        if not enabled:
+            continue
+        items.append(
+            "<span><i style='display:inline-block;width:22px;border-top:"
+            f"2px solid {color};margin-right:5px'></i>"
+            f"{html.escape(_series_title(rank, candidate))} ({score.total:.1f})"
+            "</span>"
+        )
+    if selected_candidate is not None:
+        for title, color in (
+            ("Invalidation", "#F05D68"),
+            ("Target 1.000", "#18C98B"),
+            ("Target 1.618", "#00BFA5"),
+        ):
+            items.append(
+                "<span><i style='display:inline-block;width:22px;border-top:"
+                f"2px dashed {color};margin-right:5px'></i>{title}</span>"
+            )
+    return (
+        "<div style='display:flex;gap:1.1rem;align-items:center;flex-wrap:wrap;"
+        "font-size:.68rem;color:#AAB2BF;margin:.05rem 0 .55rem'>"
+        + "".join(items)
+        + "</div>"
+    )
+
+
 def recent_rankings(
     rankings: tuple[tuple[WaveCandidate, ConfidenceScore], ...],
     latest_timestamp: pd.Timestamp,
@@ -624,6 +963,42 @@ def actionable_rankings(
     )
 
 
+def live_rankings(
+    rankings: tuple[tuple[WaveCandidate, ConfidenceScore], ...],
+) -> tuple[tuple[WaveCandidate, ConfidenceScore], ...]:
+    """Order candidates for a live terminal instead of pure score history."""
+    def observable_time(candidate: WaveCandidate) -> pd.Timestamp:
+        if candidate.status == "Forming" and candidate.active_leg is not None:
+            return candidate.active_leg.timestamp
+        if candidate.as_of is not None:
+            return candidate.as_of
+        return candidate.pivots[-1].timestamp
+
+    status_priority = {
+        "EntryReady": 0,
+        "Forming": 1,
+        "Completed": 2,
+        "Invalidated": 3,
+    }
+    pattern_priority = {
+        "Impulse": 0,
+        "ZigZag": 1,
+        "Flat": 2,
+        "Triangle": 3,
+    }
+    return tuple(
+        sorted(
+            rankings,
+            key=lambda item: (
+                -observable_time(item[0]).value,
+                status_priority.get(item[0].status, 9),
+                pattern_priority.get(item[0].pattern, 9),
+                -item[1].total,
+            ),
+        )
+    )
+
+
 def focus_dashboard(
     result: DashboardResult,
     candidate: WaveCandidate,
@@ -668,6 +1043,23 @@ def pattern_rankings(
     return featured + tuple(item for item in rankings if item not in featured)
 
 
+def fallback_rankings_for_view(
+    rankings: tuple[tuple[WaveCandidate, ConfidenceScore], ...],
+    *,
+    pattern_view: str,
+    latest_timestamp: pd.Timestamp,
+    days: int = 180,
+) -> tuple[tuple[WaveCandidate, ConfidenceScore], ...]:
+    """Return a broader-history fallback only when the scoped view is empty."""
+    if not pattern_view.startswith("Impulse"):
+        return ()
+    impulses = tuple(item for item in rankings if item[0].pattern == "Impulse")
+    if not impulses:
+        return ()
+    recent_impulses = recent_rankings(impulses, latest_timestamp, days=days)
+    return recent_impulses if recent_impulses else impulses
+
+
 def _inject_terminal_css(st) -> None:
     st.markdown(
         """
@@ -710,6 +1102,24 @@ def _inject_terminal_css(st) -> None:
         }
         .positive { color: #18c98b; }
         .negative { color: #f05d68; }
+        .status-live-badge {
+            display: inline-flex; align-items: center; justify-content: flex-end; gap: .38rem;
+        }
+        .status-live-dot {
+            width: .5rem; height: .5rem; border-radius: 999px; background: #18C98B;
+            box-shadow: 0 0 0 rgba(24, 201, 139, 0.65);
+            animation: statusPulse .95s ease-out 1;
+        }
+        @keyframes statusPulse {
+            0% { transform: scale(.7); opacity: .55; box-shadow: 0 0 0 0 rgba(24, 201, 139, 0.7); }
+            45% { transform: scale(1.15); opacity: 1; box-shadow: 0 0 0 8px rgba(24, 201, 139, 0.0); }
+            100% { transform: scale(1); opacity: .95; box-shadow: 0 0 0 0 rgba(24, 201, 139, 0.0); }
+        }
+        .status-live-dot.offline {
+            background: #F0B90B;
+            animation: none;
+            box-shadow: none;
+        }
         iframe { border-radius: 8px; }
         [data-testid="stDataFrame"] {
             border: 1px solid #202632; border-radius: 8px;
@@ -720,72 +1130,754 @@ def _inject_terminal_css(st) -> None:
     )
 
 
-def _render_single_chart() -> None:
+def _render_single_chart_fragmented() -> None:
     import streamlit as st
     from streamlit_lightweight_charts import renderLightweightCharts
 
     databases = discover_databases()
+    query = st.query_params
+    market_names = [path.name for path in databases]
+    timeframe_options = tuple(TIMEFRAMES)
+    pattern_options = (
+        "Balanced | 1-5 + ABC",
+        "Impulse | 1-5",
+        "ZigZag | ABC",
+    )
+    scope_options = ("Actionable", "Recent | 30D", "All history")
+    sensitivity_options = tuple(SENSITIVITY_PRESETS)
+
+    market_default = query.get("market", market_names[0] if market_names else None)
+    timeframe_default = query.get("timeframe", "1H")
+    pattern_default = query.get("pattern_view", pattern_options[0])
+    scope_default = query.get("candidate_scope", scope_options[0])
+    sensitivity_default = query.get("sensitivity", "Balanced")
+    live_default = query.get("live_yahoo", "0") == "1"
+    live_interval_default = query.get("live_interval", "30s")
+
     title_col, status_col = st.columns([0.75, 0.25], vertical_alignment="center")
     with title_col:
         st.title("Elliott Wave Terminal")
-        st.caption("Deterministic structure · volatility-adjusted pivots · causal scoring")
+        st.caption("Deterministic structure | volatility-adjusted pivots | causal scoring")
     with status_col:
-        st.markdown(
-            "<div style='text-align:right;color:#18c98b;font-size:.78rem;"
-            "font-weight:650'>● SYSTEM ONLINE</div>",
-            unsafe_allow_html=True,
-        )
+        status_placeholder = st.empty()
 
     (
         selector_col,
         timeframe_col,
         pattern_col,
-        multiplier_col,
-        period_col,
+        sensitivity_col,
+        live_col,
         universe_col,
-    ) = st.columns(
-        [2.0, 0.7, 1.35, 1.05, 0.9, 1.15], vertical_alignment="bottom"
-    )
+    ) = st.columns([1.95, 0.7, 1.25, 1.0, 1.0, 1.0], vertical_alignment="bottom")
+
     with selector_col:
         selected_database = st.selectbox(
             "Market",
             databases,
             format_func=lambda path: path.name,
+            index=market_names.index(market_default) if market_default in market_names else 0,
+            key="selected_market",
             disabled=not databases,
         )
     with timeframe_col:
-        timeframe_options = tuple(TIMEFRAMES)
         timeframe = st.selectbox(
             "Timeframe",
             timeframe_options,
-            index=timeframe_options.index("1H"),
+            index=timeframe_options.index(timeframe_default)
+            if timeframe_default in timeframe_options
+            else timeframe_options.index("1H"),
+            key="selected_timeframe",
         )
     with pattern_col:
         pattern_view = st.selectbox(
             "Pattern View",
-            ("Balanced · 1–5 + ABC", "Impulse · 1–5", "ZigZag · ABC"),
+            pattern_options,
+            index=pattern_options.index(pattern_default) if pattern_default in pattern_options else 0,
+            key="selected_pattern_view",
         )
-    with multiplier_col:
-        atr_multiplier = st.slider(
-            "ATR Multiplier", 1.5, 4.0, 2.0, 0.1, key="atr_multiplier"
+    with sensitivity_col:
+        sensitivity = st.selectbox(
+            "Sensitivity",
+            sensitivity_options,
+            index=sensitivity_options.index(sensitivity_default)
+            if sensitivity_default in sensitivity_options
+            else sensitivity_options.index("Balanced"),
+            key="sensitivity_preset",
         )
-    with period_col:
-        atr_period = st.slider(
-            "ATR Period", 5, 50, 14, 1, key="atr_period"
+
+    live_supported = selected_database is not None and resolve_market_symbol(selected_database) is not None
+    with live_col:
+        live_mode = st.toggle(
+            "Yahoo Live",
+            value=live_default,
+            key="live_yahoo_enabled",
+            disabled=not live_supported,
         )
     with universe_col:
         candidate_scope = st.selectbox(
-            "Candidate Scope", ("Actionable", "Recent · 30D", "All history")
+            "Candidate Scope",
+            scope_options,
+            index=scope_options.index(scope_default) if scope_default in scope_options else 0,
+            key="selected_candidate_scope",
         )
+
+    with st.expander("Advanced Settings", expanded=False):
+        advanced_override = st.checkbox(
+            "Override ATR settings",
+            value=bool(st.session_state.get("advanced_atr_override", False)),
+            key="advanced_atr_override",
+        )
+        override_cols = st.columns(3)
+        with override_cols[0]:
+            atr_multiplier_input = st.number_input(
+                "ATR Multiplier",
+                min_value=1.0,
+                max_value=6.0,
+                value=float(st.session_state.get("atr_multiplier", 2.0)),
+                step=0.1,
+                key="atr_multiplier",
+                disabled=not advanced_override,
+            )
+        with override_cols[1]:
+            atr_period_input = st.number_input(
+                "ATR Period",
+                min_value=5,
+                max_value=50,
+                value=int(st.session_state.get("atr_period", 14)),
+                step=1,
+                key="atr_period",
+                disabled=not advanced_override,
+            )
+        with override_cols[2]:
+            st.selectbox(
+                "Live refresh",
+                tuple(LIVE_REFRESH_SECONDS),
+                index=tuple(LIVE_REFRESH_SECONDS).index(live_interval_default)
+                if live_interval_default in LIVE_REFRESH_SECONDS
+                else tuple(LIVE_REFRESH_SECONDS).index("30s"),
+                key="live_refresh_interval",
+                disabled=not live_mode,
+            )
+        atr_multiplier, atr_period = resolve_sensitivity(
+            sensitivity,
+            override_enabled=advanced_override,
+            atr_multiplier=float(atr_multiplier_input),
+            atr_period=int(atr_period_input),
+        )
+        st.caption(f"Resolved engine settings: ATR {atr_period} x {atr_multiplier:.1f}")
+
+    if selected_database is not None:
+        query["market"] = selected_database.name
+    query["timeframe"] = timeframe
+    query["pattern_view"] = pattern_view
+    query["candidate_scope"] = candidate_scope
+    query["sensitivity"] = sensitivity
+    query["live_yahoo"] = "1" if live_mode else "0"
+    query["live_interval"] = st.session_state.get("live_refresh_interval", live_interval_default)
 
     if not databases or selected_database is None:
         st.info("Place a .db, .sqlite, or .sqlite3 asset database beside app.py.")
         return
 
-    try:
-        result = compute_dashboard(
-            selected_database, timeframe, atr_multiplier, atr_period
+    effective_live_mode = bool(live_mode and live_supported)
+    refresh_key = st.session_state.get("live_refresh_interval", live_interval_default)
+    refresh_seconds = LIVE_REFRESH_SECONDS.get(refresh_key, LIVE_REFRESH_SECONDS["30s"])
+
+    @st.fragment(run_every=refresh_seconds if effective_live_mode else None)
+    def _render_terminal_body() -> None:
+        live_refresh_ok: bool | None = None
+        live_state: LiveRefreshState | None = None
+        if effective_live_mode:
+            try:
+                live_state = refresh_live_database_state(selected_database)
+                st.session_state["live_poll_count"] = int(
+                    st.session_state.get("live_poll_count", 0)
+                ) + 1
+                st.session_state["live_last_checked_at"] = live_state.checked_at
+                st.session_state["live_rows_added"] = live_state.rows_added
+                if live_state.last_completed_bar is not None:
+                    st.session_state["live_last_completed_bar"] = live_state.last_completed_bar
+                st.caption(live_state.message)
+                live_refresh_ok = True
+            except Exception as error:
+                st.warning(f"Yahoo live refresh failed: {error}")
+                live_refresh_ok = False
+                st.session_state["live_poll_count"] = int(
+                    st.session_state.get("live_poll_count", 0)
+                ) + 1
+                st.session_state["live_last_checked_at"] = pd.Timestamp.now(tz="UTC")
+                st.session_state["live_rows_added"] = 0
+
+        status_label, status_color = system_status(
+            live_enabled=effective_live_mode,
+            live_supported=live_supported,
+            live_refresh_ok=live_refresh_ok,
         )
+        pulse_id = int(st.session_state.get("live_poll_count", 0))
+        status_prefix = (
+            f"<span class='status-live-dot' id='live-dot-{pulse_id}'></span>"
+            if status_label == "SYSTEM LIVE"
+            else "<span class='status-live-dot offline'></span>"
+        )
+        status_placeholder.markdown(
+            f"<div class='status-live-badge' style='text-align:right;color:{status_color};font-size:.78rem;font-weight:650'>{status_prefix}<span>{status_label}</span></div>",
+            unsafe_allow_html=True,
+        )
+
+        if effective_live_mode:
+            checked_at = st.session_state.get("live_last_checked_at")
+            rows_added = int(st.session_state.get("live_rows_added", 0))
+            last_new_bar = st.session_state.get("live_last_completed_bar")
+            checked_text = (
+                pd.Timestamp(checked_at).strftime("%d %b %H:%M:%S UTC")
+                if checked_at is not None
+                else "n/a"
+            )
+            new_bar_text = (
+                pd.Timestamp(last_new_bar).strftime("%d %b %H:%M UTC")
+                if last_new_bar is not None
+                else "n/a"
+            )
+            heartbeat_text = (
+                "Polling active"
+                if live_refresh_ok is not False
+                else "Polling error"
+            )
+            heartbeat_color = "#18C98B" if live_refresh_ok is not False else "#F05D68"
+            st.markdown(
+                "<div class='terminal-panel' style='display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.8rem'>"
+                f"<div><div class='terminal-kicker'>Live heartbeat</div><div class='terminal-value' style='color:{heartbeat_color}'>{heartbeat_text}</div></div>"
+                f"<div><div class='terminal-kicker'>Last checked</div><div class='terminal-value'>{checked_text}</div></div>"
+                f"<div><div class='terminal-kicker'>Last new bar</div><div class='terminal-value'>{new_bar_text}</div></div>"
+                f"<div><div class='terminal-kicker'>Rows added</div><div class='terminal-value'>{rows_added:+d}</div></div>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+        try:
+            result = compute_dashboard(selected_database, timeframe, atr_multiplier, atr_period)
+        except (ValueError, OSError) as error:
+            st.error(f"Unable to calculate dashboard: {error}")
+            return
+
+        if result.candles.empty:
+            st.warning("No complete candles are available for this timeframe.")
+            return
+
+        if candidate_scope == "Actionable":
+            scoped_rankings = actionable_rankings(result.rankings, result.candles)
+        elif candidate_scope.startswith("Recent"):
+            scoped_rankings = recent_rankings(result.rankings, result.candles.index[-1])
+        else:
+            scoped_rankings = result.rankings
+        scoped_rankings = live_rankings(pattern_rankings(scoped_rankings, pattern_view))
+        display_rankings = scoped_rankings
+        fallback_notice: str | None = None
+        if not scoped_rankings:
+            fallback_rankings = fallback_rankings_for_view(
+                result.rankings,
+                pattern_view=pattern_view,
+                latest_timestamp=result.candles.index[-1],
+            )
+            if fallback_rankings:
+                display_rankings = live_rankings(fallback_rankings)
+                fallback_notice = (
+                    "No impulse detected in the current scope. "
+                    "Showing the nearest recent impulse from broader history "
+                    "for Wave 3 inspection."
+                )
+        view_result = DashboardResult(
+            result.candles,
+            result.pivots,
+            display_rankings,
+            result.rsi,
+            result.pivot_state,
+        )
+
+        last_close = float(result.candles.iloc[-1]["close"])
+        previous_close = (
+            float(result.candles.iloc[-2]["close"]) if len(result.candles) > 1 else last_close
+        )
+        change = last_close - previous_close
+        change_percent = 100 * change / previous_close if previous_close else 0.0
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("LAST", f"{last_close:,.2f}", f"{change_percent:+.2f}%")
+        metric_cols[1].metric("TIMEFRAME", timeframe)
+        impulses = sum(candidate.pattern == "Impulse" for candidate, _score in scoped_rankings)
+        abc_like = sum(candidate.pattern != "Impulse" for candidate, _score in scoped_rankings)
+        metric_cols[2].metric("VALID PATHS", len(scoped_rankings), f"{impulses} impulse | {abc_like} ABC")
+        metric_cols[3].metric(
+            "DATA THROUGH",
+            _offset_timestamp(result.candles.index[-1], timeframe).strftime("%d %b | %H:%M UTC"),
+        )
+
+        top_rankings = display_rankings[:3]
+        alert_threshold = float(st.session_state.get("alert_threshold", 75.0))
+        chart_col, inspector_col = st.columns([4.9, 1.45], gap="medium")
+
+        selected_candidate = top_rankings[0][0] if top_rankings else None
+        selected_score = top_rankings[0][1] if top_rankings else None
+        selected_index = 0
+        overlays_list = [False, False, False]
+        focus_selected = True
+
+        with inspector_col:
+            st.markdown(
+                """
+                <div style='font-size:1.18rem;font-weight:700;color:#F4F7FA;margin:.15rem 0 .55rem 0'>
+                    Structure Inspector
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if fallback_notice:
+                st.warning(fallback_notice, icon="⚠️")
+            if not top_rankings:
+                if pattern_view.startswith("Impulse"):
+                    st.info(
+                        "No impulse detected in the current scope. "
+                        "Wave 3 start/end is unavailable for this filter."
+                    )
+                else:
+                    st.info("No candidates available in the current scope.")
+            else:
+                labels = [
+                    _candidate_name(index, candidate, score)
+                    for index, (candidate, score) in enumerate(top_rankings)
+                ]
+                selected_query_key = query.get("selected_candidate")
+                default_selected_index = _resolve_selected_index(
+                    top_rankings,
+                    selected_query_key,
+                )
+                selected_label = st.selectbox(
+                    "Inspect path",
+                    labels,
+                    index=default_selected_index,
+                    label_visibility="collapsed",
+                    key="selected_candidate_label",
+                )
+                selected_index = labels.index(selected_label)
+                selected_candidate, selected_score = top_rankings[selected_index]
+                query["selected_candidate"] = _candidate_query_key(selected_candidate)
+                overlays_list[selected_index] = True
+                for alt_index in range(1, min(3, len(top_rankings))):
+                    if alt_index == selected_index:
+                        overlays_list[alt_index] = True
+                        continue
+                    overlays_list[alt_index] = st.checkbox(
+                        f"Show alternative #{alt_index + 1}",
+                        value=query.get(f"overlay_{alt_index}", "0") == "1",
+                        key=f"overlay_{alt_index}",
+                    )
+                    query[f"overlay_{alt_index}"] = "1" if overlays_list[alt_index] else "0"
+                focus_selected = st.checkbox(
+                    "Focus chart on selected path",
+                    value=query.get("focus_selected", "1") == "1",
+                    key="focus_selected_path",
+                )
+                query["focus_selected"] = "1" if focus_selected else "0"
+                lifecycle = candidate_lifecycle(selected_candidate, result.candles)
+                target_low, target_high = target_zone(selected_candidate)
+                st.markdown(
+                    f"""
+                    <div class='terminal-panel'>
+                        <div class='terminal-kicker'>Selected structure</div>
+                        <div class='terminal-value {'positive' if selected_candidate.direction == 'Bullish' else 'negative'}'>
+                            {html.escape(selected_candidate.pattern)} | {html.escape(selected_candidate.direction)}
+                        </div>
+                        <div style='color:#8c96a5;font-size:.78rem;margin-top:.28rem'>
+                            Stage: {html.escape(selected_candidate.status)} | Lifecycle: {html.escape(lifecycle)}
+                        </div>
+                    </div>
+                    <div class='terminal-panel'>
+                        <div class='terminal-kicker'>Confidence Score</div>
+                        <div class='terminal-value'>{selected_score.total:.1f} / 100</div>
+                    </div>
+                    <div class='terminal-panel'>
+                        <div class='terminal-kicker'>{'Floor' if selected_candidate.invalidation_side == 'below' else 'Ceiling'} invalidation</div>
+                        <div class='terminal-value negative'>{selected_candidate.invalidation_level:,.2f}</div>
+                    </div>
+                    <div class='terminal-panel'>
+                        <div class='terminal-kicker'>Fibonacci target zone</div>
+                        <div class='terminal-value positive'>{target_low:,.2f} - {target_high:,.2f}</div>
+                    </div>
+                    <div class='terminal-panel'>
+                        <div class='terminal-kicker'>Current wave</div>
+                        <div class='terminal-value'>{html.escape(current_wave_label(selected_candidate))}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                wave_three = wave_three_window(selected_candidate)
+                if wave_three is not None:
+                    st.markdown(
+                        f"""
+                        <div class='terminal-panel'>
+                            <div class='terminal-kicker'>Wave 3 window</div>
+                            <div style='color:#f2f5f8;font-size:.8rem'>{html.escape(_format_wave_point(wave_three[0]))}</div>
+                            <div style='color:#f2f5f8;font-size:.8rem;margin-top:.2rem'>{html.escape(_format_wave_point(wave_three[1]))}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                elif selected_candidate.pattern == "Impulse":
+                    st.markdown(
+                        """
+                        <div class='terminal-panel'>
+                            <div class='terminal-kicker'>Wave 3 window</div>
+                            <div style='color:#f2f5f8;font-size:.8rem'>Unavailable for the selected impulse candidate.</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                hint_rows = []
+                for hint in system_hints(
+                    selected_candidate,
+                    selected_score,
+                    alert_threshold,
+                    lifecycle=lifecycle,
+                ):
+                    label, _, value = hint.partition(": ")
+                    if not value:
+                        label, value = hint, ""
+                    hint_rows.append(
+                        "<tr>"
+                        f"<td style='padding:.28rem .4rem .28rem 0;color:#F4F7FA;font-weight:650;white-space:nowrap'>{html.escape(label)}</td>"
+                        f"<td style='padding:.28rem 0;color:#F4F7FA'>{_format_hint_value(value)}</td>"
+                        "</tr>"
+                    )
+                st.markdown(
+                    "<div class='terminal-panel'><div class='terminal-kicker'>System hints</div>"
+                    "<table style='width:100%;border-collapse:collapse;margin-top:.35rem;font-size:.78rem'>"
+                    + "".join(hint_rows)
+                    + "</table></div>",
+                    unsafe_allow_html=True,
+                )
+
+                with st.expander("Score audit", expanded=False):
+                    items = [
+                        {
+                            "Guideline": item.reason,
+                            "Points": f"{item.points:.2f}/{item.maximum:.0f}",
+                        }
+                        for item in selected_score.items
+                    ]
+                    if items:
+                        st.dataframe(pd.DataFrame(items), hide_index=True, width="stretch")
+                    else:
+                        st.info("No score audit items available.")
+
+        overlays = tuple(overlays_list[:3])
+        with chart_col:
+            legend_candidate = selected_candidate if top_rankings else None
+            st.markdown(_legend_markup(top_rankings, overlays, legend_candidate), unsafe_allow_html=True)
+            if selected_candidate is not None and selected_score is not None:
+                threshold_text, buy_text, sell_text = marker_status(
+                    top_rankings,
+                    overlays,
+                    alert_threshold,
+                )
+            else:
+                threshold_text, buy_text, sell_text = ("n/a", "n/a", "n/a")
+            st.markdown(
+                "<div class='terminal-panel' style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:.8rem'>"
+                f"<div><div class='terminal-kicker'>Marker threshold</div><div class='terminal-value'>{threshold_text}</div></div>"
+                f"<div><div class='terminal-kicker'>Buy at</div><div class='terminal-value positive'>{html.escape(buy_text)}</div></div>"
+                f"<div><div class='terminal-kicker'>Sell at</div><div class='terminal-value negative'>{html.escape(sell_text)}</div></div>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            chart_result = (
+                focus_dashboard(view_result, selected_candidate)
+                if selected_candidate is not None and focus_selected
+                else view_result
+            )
+            renderLightweightCharts(
+                build_lightweight_charts(
+                    chart_result,
+                    overlays,
+                    selected_index=selected_index,
+                    alert_threshold=alert_threshold,
+                ),
+                key=(
+                    f"elliott-{selected_database.name}-{timeframe}-{candidate_scope}-"
+                    f"{selected_index}-{overlays}-{focus_selected}-{alert_threshold}-"
+                    f"{pattern_view}-{sensitivity}-{effective_live_mode}"
+                ),
+            )
+            selected_lifecycle = (
+                candidate_lifecycle(selected_candidate, result.candles)
+                if selected_candidate is not None
+                else None
+            )
+            recommendation = trader_recommendation(
+                selected_candidate,
+                selected_score,
+                alert_threshold,
+                selected_lifecycle,
+            )
+            st.markdown(
+                f"""
+                <div class='terminal-panel' style='margin-top:.35rem'>
+                    <div style='display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;flex-wrap:wrap'>
+                        <div style='min-width:180px'>
+                            <div class='terminal-kicker'>Trader-facing mode</div>
+                            <div style='font-size:1.2rem;font-weight:750;color:{recommendation.color};margin-top:.15rem'>{html.escape(recommendation.action)}</div>
+                            <div style='color:#F4F7FA;font-size:.82rem;margin-top:.15rem'>{html.escape(recommendation.status_text)}</div>
+                        </div>
+                        <div style='display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:.85rem;flex:1;min-width:300px'>
+                            <div>
+                                <div class='terminal-kicker'>Entry</div>
+                                <div class='terminal-value'>{html.escape(recommendation.entry_text)}</div>
+                            </div>
+                            <div>
+                                <div class='terminal-kicker'>Stop</div>
+                                <div class='terminal-value negative'>{html.escape(recommendation.stop_text)}</div>
+                            </div>
+                            <div>
+                                <div class='terminal-kicker'>Target zone</div>
+                                <div class='terminal-value positive'>{html.escape(recommendation.target_text)}</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div style='display:grid;grid-template-columns:1fr 1fr;gap:.55rem;margin-top:.65rem'>
+                        <div style='color:#F4F7FA;font-size:.8rem'><strong>Reason 1:</strong> {html.escape(recommendation.rationale[0])}</div>
+                        <div style='color:#F4F7FA;font-size:.8rem'><strong>Reason 2:</strong> {html.escape(recommendation.rationale[1])}</div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        history_col, operations_col = st.columns([0.7, 0.3], gap="medium")
+        with history_col:
+            with st.expander("Candidate history", expanded=False):
+                if not scoped_rankings:
+                    st.info("No candidate history in this scope.")
+                else:
+                    history_rows = [
+                        {
+                            "Rank": index + 1,
+                            "Pattern": candidate.pattern,
+                            "Status": candidate.status,
+                            "Direction": candidate.direction,
+                            "Confidence": round(score.total, 2),
+                            "Wave": current_wave_label(candidate),
+                        }
+                        for index, (candidate, score) in enumerate(scoped_rankings[:25])
+                    ]
+                    st.dataframe(pd.DataFrame(history_rows), hide_index=True, width="stretch")
+
+        with operations_col:
+            with st.expander("Alerts & operations", expanded=False):
+                st.caption(
+                    "Telegram shell remains local-only in this MVP. "
+                    "Use the selected candidate, threshold gate, and trader-facing panel "
+                    "to decide whether to forward a signal externally."
+                )
+                bot_token = st.text_input("Bot Token", type="password", key="telegram_bot_token")
+                chat_id = st.text_input("Chat ID", key="telegram_chat_id")
+                st.slider(
+                    "Alert Confidence Score",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=float(st.session_state.get("alert_threshold", 75.0)),
+                    step=0.5,
+                    key="alert_threshold",
+                )
+                if st.button("Emit local alert shell", width="stretch"):
+                    emit_alert_shell(selected_candidate, selected_score, bot_token, chat_id)
+
+    _render_terminal_body()
+
+
+def _render_single_chart() -> None:
+    _render_single_chart_fragmented()
+    return
+
+    import streamlit as st
+    import streamlit.components.v1 as components
+    from streamlit_lightweight_charts import renderLightweightCharts
+
+    databases = discover_databases()
+    query = st.query_params
+    market_names = [path.name for path in databases]
+    timeframe_options = tuple(TIMEFRAMES)
+    pattern_options = (
+        "Balanced | 1-5 + ABC",
+        "Impulse | 1-5",
+        "ZigZag | ABC",
+    )
+    scope_options = ("Actionable", "Recent | 30D", "All history")
+    sensitivity_options = tuple(SENSITIVITY_PRESETS)
+
+    market_default = query.get("market", market_names[0] if market_names else None)
+    timeframe_default = query.get("timeframe", "1H")
+    pattern_default = query.get("pattern_view", pattern_options[0])
+    scope_default = query.get("candidate_scope", scope_options[0])
+    sensitivity_default = query.get("sensitivity", "Balanced")
+    live_default = query.get("live_yahoo", "0") == "1"
+    live_interval_default = query.get("live_interval", "30s")
+
+    title_col, status_col = st.columns([0.75, 0.25], vertical_alignment="center")
+    with title_col:
+        st.title("Elliott Wave Terminal")
+        st.caption("Deterministic structure | volatility-adjusted pivots | causal scoring")
+    with status_col:
+        status_placeholder = st.empty()
+
+    (
+        selector_col,
+        timeframe_col,
+        pattern_col,
+        sensitivity_col,
+        live_col,
+        universe_col,
+    ) = st.columns([1.95, 0.7, 1.25, 1.0, 1.0, 1.0], vertical_alignment="bottom")
+
+    with selector_col:
+        selected_database = st.selectbox(
+            "Market",
+            databases,
+            format_func=lambda path: path.name,
+            index=market_names.index(market_default) if market_default in market_names else 0,
+            key="selected_market",
+            disabled=not databases,
+        )
+    with timeframe_col:
+        timeframe = st.selectbox(
+            "Timeframe",
+            timeframe_options,
+            index=timeframe_options.index(timeframe_default) if timeframe_default in timeframe_options else timeframe_options.index("1H"),
+            key="selected_timeframe",
+        )
+    with pattern_col:
+        pattern_view = st.selectbox(
+            "Pattern View",
+            pattern_options,
+            index=pattern_options.index(pattern_default) if pattern_default in pattern_options else 0,
+            key="selected_pattern_view",
+        )
+    with sensitivity_col:
+        sensitivity = st.selectbox(
+            "Sensitivity",
+            sensitivity_options,
+            index=sensitivity_options.index(sensitivity_default) if sensitivity_default in sensitivity_options else sensitivity_options.index("Balanced"),
+            key="sensitivity_preset",
+        )
+    live_supported = selected_database is not None and resolve_market_symbol(selected_database) is not None
+    with live_col:
+        live_mode = st.toggle(
+            "Yahoo Live",
+            value=live_default,
+            key="live_yahoo_enabled",
+            disabled=not live_supported,
+        )
+    with universe_col:
+        candidate_scope = st.selectbox(
+            "Candidate Scope",
+            scope_options,
+            index=scope_options.index(scope_default) if scope_default in scope_options else 0,
+            key="selected_candidate_scope",
+        )
+
+    with st.expander("Advanced Settings", expanded=False):
+        advanced_override = st.checkbox(
+            "Override ATR settings",
+            value=bool(st.session_state.get("advanced_atr_override", False)),
+            key="advanced_atr_override",
+        )
+        override_cols = st.columns(3)
+        with override_cols[0]:
+            atr_multiplier_input = st.number_input(
+                "ATR Multiplier",
+                min_value=1.0,
+                max_value=6.0,
+                value=float(st.session_state.get("atr_multiplier", 2.0)),
+                step=0.1,
+                key="atr_multiplier",
+                disabled=not advanced_override,
+            )
+        with override_cols[1]:
+            atr_period_input = st.number_input(
+                "ATR Period",
+                min_value=5,
+                max_value=50,
+                value=int(st.session_state.get("atr_period", 14)),
+                step=1,
+                key="atr_period",
+                disabled=not advanced_override,
+            )
+        with override_cols[2]:
+            live_interval = st.selectbox(
+                "Live refresh",
+                tuple(LIVE_REFRESH_SECONDS),
+                index=tuple(LIVE_REFRESH_SECONDS).index(live_interval_default)
+                if live_interval_default in LIVE_REFRESH_SECONDS
+                else tuple(LIVE_REFRESH_SECONDS).index("30s"),
+                key="live_refresh_interval",
+                disabled=not live_mode,
+            )
+        atr_multiplier, atr_period = resolve_sensitivity(
+            sensitivity,
+            override_enabled=advanced_override,
+            atr_multiplier=float(atr_multiplier_input),
+            atr_period=int(atr_period_input),
+        )
+        st.caption(f"Resolved engine settings: ATR {atr_period} x {atr_multiplier:.1f}")
+
+    if selected_database is not None:
+        query["market"] = selected_database.name
+    query["timeframe"] = timeframe
+    query["pattern_view"] = pattern_view
+    query["candidate_scope"] = candidate_scope
+    query["sensitivity"] = sensitivity
+    query["live_yahoo"] = "1" if live_mode else "0"
+    query["live_interval"] = st.session_state.get("live_refresh_interval", live_interval_default)
+
+    if not databases or selected_database is None:
+        st.info("Place a .db, .sqlite, or .sqlite3 asset database beside app.py.")
+        return
+
+    live_refresh_ok: bool | None = None
+    if not live_supported:
+        live_mode = False
+    elif live_mode:
+        try:
+            st.caption(refresh_live_database(selected_database))
+            live_refresh_ok = True
+        except Exception as error:
+            st.warning(f"Yahoo live refresh failed: {error}")
+            live_refresh_ok = False
+        refresh_seconds = LIVE_REFRESH_SECONDS[st.session_state.get("live_refresh_interval", "30s")]
+        components.html(
+            f"""
+            <script>
+            window.parent.clearTimeout(window.__elliottYahooLiveTimer);
+            window.__elliottYahooLiveTimer = window.parent.setTimeout(
+                function() {{ window.parent.location.reload(); }},
+                {refresh_seconds * 1000}
+            );
+            </script>
+            """,
+            height=0,
+        )
+
+    status_label, status_color = system_status(
+        live_enabled=live_mode,
+        live_supported=live_supported,
+        live_refresh_ok=live_refresh_ok,
+    )
+    with status_col:
+        status_placeholder.markdown(
+            f"<div style='text-align:right;color:{status_color};font-size:.78rem;font-weight:650'>{status_label}</div>",
+            unsafe_allow_html=True,
+        )
+
+    try:
+        result = compute_dashboard(selected_database, timeframe, atr_multiplier, atr_period)
     except (ValueError, OSError) as error:
         st.error(f"Unable to calculate dashboard: {error}")
         return
@@ -797,203 +1889,227 @@ def _render_single_chart() -> None:
     if candidate_scope == "Actionable":
         scoped_rankings = actionable_rankings(result.rankings, result.candles)
     elif candidate_scope.startswith("Recent"):
-        scoped_rankings = recent_rankings(
-            result.rankings, result.candles.index[-1]
-        )
+        scoped_rankings = recent_rankings(result.rankings, result.candles.index[-1])
     else:
         scoped_rankings = result.rankings
-    scoped_rankings = pattern_rankings(scoped_rankings, pattern_view)
+    scoped_rankings = live_rankings(pattern_rankings(scoped_rankings, pattern_view))
+    display_rankings = scoped_rankings
+    fallback_notice: str | None = None
+    if not scoped_rankings:
+        fallback_rankings = fallback_rankings_for_view(
+            result.rankings,
+            pattern_view=pattern_view,
+            latest_timestamp=result.candles.index[-1],
+        )
+        if fallback_rankings:
+            display_rankings = live_rankings(fallback_rankings)
+            fallback_notice = (
+                "No impulse detected in the current scope. "
+                "Showing the nearest recent impulse from broader history "
+                "for Wave 3 inspection."
+            )
     view_result = DashboardResult(
         result.candles,
         result.pivots,
-        scoped_rankings,
+        display_rankings,
         result.rsi,
         result.pivot_state,
     )
 
     last_close = float(result.candles.iloc[-1]["close"])
-    previous_close = (
-        float(result.candles.iloc[-2]["close"])
-        if len(result.candles) > 1
-        else last_close
-    )
+    previous_close = float(result.candles.iloc[-2]["close"]) if len(result.candles) > 1 else last_close
     change = last_close - previous_close
     change_percent = 100 * change / previous_close if previous_close else 0.0
     metric_cols = st.columns(4)
     metric_cols[0].metric("LAST", f"{last_close:,.2f}", f"{change_percent:+.2f}%")
     metric_cols[1].metric("TIMEFRAME", timeframe)
-    impulses = sum(
-        candidate.pattern == "Impulse" for candidate, _score in scoped_rankings
-    )
-    zigzags = sum(
-        candidate.pattern == "ZigZag" for candidate, _score in scoped_rankings
-    )
-    metric_cols[2].metric(
-        "VALID PATHS", len(scoped_rankings), f"{impulses} impulse · {zigzags} ABC"
-    )
+    impulses = sum(candidate.pattern == "Impulse" for candidate, _score in scoped_rankings)
+    abc_like = sum(candidate.pattern != "Impulse" for candidate, _score in scoped_rankings)
+    metric_cols[2].metric("VALID PATHS", len(scoped_rankings), f"{impulses} impulse | {abc_like} ABC")
     metric_cols[3].metric(
-        "DATA THROUGH", result.candles.index[-1].strftime("%d %b · %H:%M UTC")
+        "DATA THROUGH",
+        _offset_timestamp(result.candles.index[-1], timeframe).strftime("%d %b | %H:%M UTC"),
     )
 
-    alert_threshold = float(st.session_state.get("alert_threshold", 75))
-    chart_col, inspector_col = st.columns([0.78, 0.22], gap="medium")
-    top_rankings = scoped_rankings[:3]
+    top_rankings = display_rankings[:3]
+    alert_threshold = float(st.session_state.get("alert_threshold", 75.0))
+
+    chart_col, inspector_col = st.columns([4.9, 1.45], gap="medium")
+
+    selected_candidate = top_rankings[0][0] if top_rankings else None
+    selected_score = top_rankings[0][1] if top_rankings else None
+    selected_index = 0
+    overlays_list = [False, False, False]
+    focus_selected = True
+
     with inspector_col:
-        st.markdown("### Structure Inspector")
+        st.markdown(
+            """
+            <div style='font-size:1.18rem;font-weight:700;color:#F4F7FA;margin:.15rem 0 .55rem 0'>
+                Structure Inspector
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if fallback_notice:
+            st.warning(fallback_notice, icon="⚠️")
         if not top_rankings:
-            selected_index = 0
-            overlays = (False, False, False)
-            focus_selected = False
-            st.info(f"No valid {pattern_view.split(' · ')[0]} candidates in this scope.")
+            if pattern_view.startswith("Impulse"):
+                st.info(
+                    "No impulse detected in the current scope. "
+                    "Wave 3 start/end is unavailable for this filter."
+                )
+            else:
+                st.info("No candidates available in the current scope.")
         else:
-            selected_index = st.selectbox(
-                "Focused path",
-                range(len(top_rankings)),
-                format_func=lambda index: _candidate_name(
-                    index, *top_rankings[index]
-                ),
+            labels = [
+                _candidate_name(index, candidate, score)
+                for index, (candidate, score) in enumerate(top_rankings)
+            ]
+            selected_query_key = query.get("selected_candidate")
+            default_selected_index = _resolve_selected_index(
+                top_rankings,
+                selected_query_key,
+            )
+            selected_label = st.selectbox(
+                "Inspect path",
+                labels,
+                index=default_selected_index,
                 label_visibility="collapsed",
+                key="selected_candidate_label",
             )
-            overlay_values_list: list[bool] = []
-            for index, (candidate, _score) in enumerate(top_rankings):
-                if index == selected_index:
-                    st.caption(f"Focused overlay: #{index + 1} {candidate.pattern}")
-                    overlay_values_list.append(True)
-                else:
-                    overlay_values_list.append(
-                        st.checkbox(
-                            f"Show alternative #{index + 1}",
-                            value=False,
-                            key=(
-                                f"overlay-{index}-{timeframe}-"
-                                f"{selected_database.name}"
-                            ),
-                        )
-                    )
-            overlay_values = tuple(overlay_values_list)
-            overlays = tuple(
-                overlay_values[index] if index < len(overlay_values) else False
-                for index in range(3)
+            selected_index = labels.index(selected_label)
+            selected_candidate, selected_score = top_rankings[selected_index]
+            query["selected_candidate"] = _candidate_query_key(selected_candidate)
+            overlays_list[selected_index] = True
+            for alt_index in range(1, min(3, len(top_rankings))):
+                if alt_index == selected_index:
+                    overlays_list[alt_index] = True
+                    continue
+                overlays_list[alt_index] = st.checkbox(
+                    f"Show alternative #{alt_index + 1}",
+                    value=query.get(f"overlay_{alt_index}", "0") == "1",
+                    key=f"overlay_{alt_index}",
+                )
+                query[f"overlay_{alt_index}"] = (
+                    "1" if overlays_list[alt_index] else "0"
+                )
+            focus_selected = st.checkbox(
+                "Focus chart on selected path",
+                value=query.get("focus_selected", "1") == "1",
+                key="focus_selected_path",
             )
-            candidate, score = top_rankings[selected_index]
-            lifecycle = candidate_lifecycle(candidate, result.candles)
-            low_target, high_target = target_zone(candidate)
-            boundary = (
-                "Floor" if candidate.invalidation_side == "below" else "Ceiling"
-            )
-            direction_class = (
-                "positive" if candidate.direction == "Bullish" else "negative"
-            )
+            query["focus_selected"] = "1" if focus_selected else "0"
+            lifecycle = candidate_lifecycle(selected_candidate, result.candles)
+            target_low, target_high = target_zone(selected_candidate)
             st.markdown(
                 f"""
-                <div class="terminal-panel">
-                  <div class="terminal-kicker">Selected structure</div>
-                  <div class="terminal-value {direction_class}">
-                    {candidate.pattern} · {candidate.direction}
-                  </div>
-                  <div style="color:#8c96a5;font-size:.7rem;margin-top:.2rem">
-                    Stage: {candidate.status} · Lifecycle: {lifecycle}
-                  </div>
+                <div class='terminal-panel'>
+                    <div class='terminal-kicker'>Selected structure</div>
+                    <div class='terminal-value {'positive' if selected_candidate.direction == 'Bullish' else 'negative'}'>
+                        {html.escape(selected_candidate.pattern)} | {html.escape(selected_candidate.direction)}
+                    </div>
+                    <div style='color:#8c96a5;font-size:.78rem;margin-top:.28rem'>
+                        Stage: {html.escape(selected_candidate.status)} | Lifecycle: {html.escape(lifecycle)}
+                    </div>
                 </div>
-                <div class="terminal-panel">
-                  <div class="terminal-kicker">Confidence Score</div>
-                  <div class="terminal-value">{score.total:.1f}
-                    <span style="color:#6f7a89;font-size:.8rem"> / 100</span>
-                  </div>
+                <div class='terminal-panel'>
+                    <div class='terminal-kicker'>Confidence Score</div>
+                    <div class='terminal-value'>{selected_score.total:.1f} / 100</div>
                 </div>
-                <div class="terminal-panel">
-                  <div class="terminal-kicker">{boundary} invalidation</div>
-                  <div class="terminal-value negative">
-                    {candidate.invalidation_level:,.2f}
-                  </div>
+                <div class='terminal-panel'>
+                    <div class='terminal-kicker'>{'Floor' if selected_candidate.invalidation_side == 'below' else 'Ceiling'} invalidation</div>
+                    <div class='terminal-value negative'>{selected_candidate.invalidation_level:,.2f}</div>
                 </div>
-                <div class="terminal-panel">
-                  <div class="terminal-kicker">Fibonacci target zone</div>
-                  <div class="terminal-value positive">
-                    {low_target:,.2f} – {high_target:,.2f}
-                  </div>
+                <div class='terminal-panel'>
+                    <div class='terminal-kicker'>Fibonacci target zone</div>
+                    <div class='terminal-value positive'>{target_low:,.2f} - {target_high:,.2f}</div>
+                </div>
+                <div class='terminal-panel'>
+                    <div class='terminal-kicker'>Current wave</div>
+                    <div class='terminal-value'>{html.escape(current_wave_label(selected_candidate))}</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
-            hints = system_hints(
-                candidate, score, alert_threshold, lifecycle
-            )
+            wave_three = wave_three_window(selected_candidate)
+            if wave_three is not None:
+                st.markdown(
+                    f"""
+                    <div class='terminal-panel'>
+                        <div class='terminal-kicker'>Wave 3 window</div>
+                        <div style='color:#f2f5f8;font-size:.8rem'>{html.escape(_format_wave_point(wave_three[0]))}</div>
+                        <div style='color:#f2f5f8;font-size:.8rem;margin-top:.2rem'>{html.escape(_format_wave_point(wave_three[1]))}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            elif selected_candidate.pattern == "Impulse":
+                st.markdown(
+                    """
+                    <div class='terminal-panel'>
+                        <div class='terminal-kicker'>Wave 3 window</div>
+                        <div style='color:#f2f5f8;font-size:.8rem'>Unavailable for the selected impulse candidate.</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
             hint_rows = []
-            for hint in hints:
-                label, separator, value = hint.partition(":")
-                if not separator:
-                    label, value = "Status", hint
+            for hint in system_hints(selected_candidate, selected_score, alert_threshold, lifecycle=lifecycle):
+                label, _, value = hint.partition(": ")
+                if not value:
+                    label, value = hint, ""
                 hint_rows.append(
                     "<tr>"
-                    "<td style='color:#F4F7FA;font-weight:700;"
-                    "font-size:.71rem;vertical-align:top;padding:.3rem .7rem "
-                    f".3rem 0;white-space:nowrap'>{html.escape(label)}</td>"
-                    "<td style='color:#F4F7FA;font-size:.71rem;"
-                    "line-height:1.35;padding:.3rem 0'>"
-                    f"{_format_hint_value(value.strip())}</td>"
+                    f"<td style='padding:.28rem .4rem .28rem 0;color:#F4F7FA;font-weight:650;white-space:nowrap'>{html.escape(label)}</td>"
+                    f"<td style='padding:.28rem 0;color:#F4F7FA'>{_format_hint_value(value)}</td>"
                     "</tr>"
                 )
             st.markdown(
-                "<div class='terminal-panel'>"
-                "<div class='terminal-kicker'>System Hints</div>"
-                "<table style='width:100%;border-collapse:collapse;"
-                "border:0;margin-top:.35rem'><tbody>"
+                "<div class='terminal-panel'><div class='terminal-kicker'>System hints</div>"
+                "<table style='width:100%;border-collapse:collapse;margin-top:.35rem;font-size:.78rem'>"
                 + "".join(hint_rows)
-                + "</tbody></table></div>",
+                + "</table></div>",
                 unsafe_allow_html=True,
             )
-            focus_selected = st.checkbox(
-                "Focus chart on selected path", value=True
-            )
-            with st.expander("Score audit", expanded=False):
-                for item in score.items:
-                    earned = item.points / item.maximum if item.maximum else 0
-                    st.markdown(
-                        f"<div style='font-size:.75rem;color:#aab2bf;"
-                        f"margin-top:.4rem'>{item.reason}</div>"
-                        f"<div style='font-size:.73rem;color:#eef1f5'>"
-                        f"{item.points:.2f} / {item.maximum:.0f}</div>"
-                        f"<div style='height:3px;background:#202632;"
-                        f"margin:.2rem 0'><div style='width:{earned * 100:.1f}%;"
-                        f"height:3px;background:#00bfa5'></div></div>",
-                        unsafe_allow_html=True,
-                    )
 
+            with st.expander("Score audit", expanded=False):
+                items = [
+                    {
+                        "Guideline": item.reason,
+                        "Points": f"{item.points:.2f}/{item.maximum:.0f}",
+                    }
+                    for item in selected_score.items
+                ]
+                if items:
+                    st.dataframe(pd.DataFrame(items), hide_index=True, width="stretch")
+                else:
+                    st.info("No score audit items available.")
+
+    overlays = tuple(overlays_list[:3])
     with chart_col:
+        legend_candidate = selected_candidate if top_rankings else None
+        st.markdown(_legend_markup(top_rankings, overlays, legend_candidate), unsafe_allow_html=True)
+        if selected_candidate is not None and selected_score is not None:
+            threshold_text, buy_text, sell_text = marker_status(
+                top_rankings,
+                overlays,
+                alert_threshold,
+            )
+        else:
+            threshold_text, buy_text, sell_text = ("n/a", "n/a", "n/a")
         st.markdown(
-            "<div style='display:flex;gap:1.1rem;align-items:center;"
-            "font-size:.68rem;color:#AAB2BF;margin:.05rem 0 .55rem'>"
-            "<span><b style='color:#F4F7FA'>LEGEND</b></span>"
-            "<span><i style='display:inline-block;width:22px;border-top:"
-            "2px solid #00D4FF;margin-right:5px'></i>Completed</span>"
-            "<span><i style='display:inline-block;width:22px;border-top:"
-            "2px dashed #FFB000;margin-right:5px'></i>Forming</span>"
-            "<span><b style='color:#18C98B;margin-right:5px'>▲</b>"
-            "EntryReady bullish</span>"
-            "<span><b style='color:#F05D68;margin-right:5px'>▼</b>"
-            "EntryReady bearish</span>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        threshold_text, buy_text, sell_text = marker_status(
-            view_result.rankings, overlays, alert_threshold
-        )
-        st.markdown(
-            "<div class='terminal-panel' style='display:grid;"
-            "grid-template-columns:repeat(3,1fr);gap:.8rem;margin-bottom:.7rem'>"
-            "<div><span class='terminal-kicker'>Marker threshold</span>"
-            f"<div class='terminal-value'>{threshold_text}</div></div>"
-            "<div><span class='terminal-kicker'>Buy at</span>"
-            f"<div class='terminal-value' style='color:#18C98B'>{buy_text}</div></div>"
-            "<div><span class='terminal-kicker'>Sell at</span>"
-            f"<div class='terminal-value' style='color:#F05D68'>{sell_text}</div></div>"
+            "<div class='terminal-panel' style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:.8rem'>"
+            f"<div><div class='terminal-kicker'>Marker threshold</div><div class='terminal-value'>{threshold_text}</div></div>"
+            f"<div><div class='terminal-kicker'>Buy at</div><div class='terminal-value positive'>{html.escape(buy_text)}</div></div>"
+            f"<div><div class='terminal-kicker'>Sell at</div><div class='terminal-value negative'>{html.escape(sell_text)}</div></div>"
             "</div>",
             unsafe_allow_html=True,
         )
         chart_result = (
-            focus_dashboard(view_result, top_rankings[selected_index][0])
-            if top_rankings and focus_selected
+            focus_dashboard(view_result, selected_candidate)
+            if selected_candidate is not None and focus_selected
             else view_result
         )
         renderLightweightCharts(
@@ -1004,10 +2120,53 @@ def _render_single_chart() -> None:
                 alert_threshold=alert_threshold,
             ),
             key=(
-                f"elliott-{selected_database.name}-{timeframe}-"
-                f"{candidate_scope}-{selected_index}-{overlays}-"
-                f"{bool(top_rankings and focus_selected)}-{alert_threshold}"
+                f"elliott-{selected_database.name}-{timeframe}-{candidate_scope}-"
+                f"{selected_index}-{overlays}-{focus_selected}-{alert_threshold}-"
+                f"{pattern_view}-{sensitivity}-{live_mode}"
             ),
+        )
+        selected_lifecycle = (
+            candidate_lifecycle(selected_candidate, result.candles)
+            if selected_candidate is not None
+            else None
+        )
+        recommendation = trader_recommendation(
+            selected_candidate,
+            selected_score,
+            alert_threshold,
+            selected_lifecycle,
+        )
+        st.markdown(
+            f"""
+            <div class='terminal-panel' style='margin-top:.35rem'>
+                <div style='display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;flex-wrap:wrap'>
+                    <div style='min-width:180px'>
+                        <div class='terminal-kicker'>Trader-facing mode</div>
+                        <div style='font-size:1.2rem;font-weight:750;color:{recommendation.color};margin-top:.15rem'>{html.escape(recommendation.action)}</div>
+                        <div style='color:#F4F7FA;font-size:.82rem;margin-top:.15rem'>{html.escape(recommendation.status_text)}</div>
+                    </div>
+                    <div style='display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:.85rem;flex:1;min-width:300px'>
+                        <div>
+                            <div class='terminal-kicker'>Entry</div>
+                            <div class='terminal-value'>{html.escape(recommendation.entry_text)}</div>
+                        </div>
+                        <div>
+                            <div class='terminal-kicker'>Stop</div>
+                            <div class='terminal-value negative'>{html.escape(recommendation.stop_text)}</div>
+                        </div>
+                        <div>
+                            <div class='terminal-kicker'>Target zone</div>
+                            <div class='terminal-value positive'>{html.escape(recommendation.target_text)}</div>
+                        </div>
+                    </div>
+                </div>
+                <div style='display:grid;grid-template-columns:1fr 1fr;gap:.55rem;margin-top:.65rem'>
+                    <div style='color:#F4F7FA;font-size:.8rem'><strong>Reason 1:</strong> {html.escape(recommendation.rationale[0])}</div>
+                    <div style='color:#F4F7FA;font-size:.8rem'><strong>Reason 2:</strong> {html.escape(recommendation.rationale[1])}</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
     history_col, operations_col = st.columns([0.7, 0.3], gap="medium")
@@ -1023,51 +2182,30 @@ def _render_single_chart() -> None:
                         "Stage": candidate.status,
                         "Direction": candidate.direction,
                         "Score": score.total,
-                        "Lifecycle": candidate_lifecycle(
-                            candidate, result.candles
-                        ),
-                        "Completed": candidate.pivots[-1].timestamp.strftime(
-                            "%Y-%m-%d %H:%M"
-                        ),
+                        "Lifecycle": candidate_lifecycle(candidate, result.candles),
+                        "Completed": _setup_endpoint(candidate)[0].strftime("%Y-%m-%d %H:%M"),
                     }
                     for index, (candidate, score) in enumerate(scoped_rankings)
                 ]
-                st.dataframe(
-                    pd.DataFrame(rows),
-                    hide_index=True,
-                    width="stretch",
-                    height=280,
-                )
+                st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=280)
 
     with operations_col:
         with st.expander("Alerts & operations", expanded=False):
             st.markdown(
                 "<div class='terminal-kicker'>Telegram Bot Token</div>"
                 "<div style='font-size:.78rem;color:#8c96a5;margin:.25rem 0 .7rem'>"
-                "Configure <code>TELEGRAM_BOT_TOKEN</code> in "
-                "<code>.streamlit/secrets.toml</code>. Tokens are never entered "
-                "into the browser.</div>",
+                "Configure <code>TELEGRAM_BOT_TOKEN</code> in <code>.streamlit/secrets.toml</code>. "
+                "Tokens are never entered into the browser.</div>",
                 unsafe_allow_html=True,
             )
             chat_id = st.text_input("Telegram Chat ID")
-            alert_threshold = st.slider(
-                "Alert Confidence Score", 0, 100, 75, key="alert_threshold"
-            )
+            alert_threshold = st.slider("Alert Confidence Score", 0, 100, int(alert_threshold), key="alert_threshold")
             st.caption("Log-only webhook shell. No network request is sent.")
             if scoped_rankings:
                 candidate, score = scoped_rankings[0]
-                alert = format_setup_alert(
-                    candidate, score, alert_threshold, chat_id=chat_id
-                )
-                alert_key = (
-                    candidate.pivots[-1].timestamp.isoformat(),
-                    score.total,
-                    alert_threshold,
-                )
-                if (
-                    alert
-                    and st.session_state.get("last_alert_key") != alert_key
-                ):
+                alert = format_setup_alert(candidate, score, alert_threshold, chat_id=chat_id)
+                alert_key = (candidate.pivots[-1].timestamp.isoformat(), score.total, alert_threshold)
+                if alert and st.session_state.get("last_alert_key") != alert_key:
                     log_alert_background(alert)
                     st.session_state["last_alert_key"] = alert_key
                     st.success("Setup written to application logs.")
@@ -1105,9 +2243,7 @@ def scan_global_markets(
     for database in databases:
         for timeframe in TIMEFRAMES:
             try:
-                result = compute_dashboard(
-                    database, timeframe, atr_multiplier, atr_period
-                )
+                result = compute_dashboard(database, timeframe, atr_multiplier, atr_period)
             except handled_errors as error:
                 errors.append(f"{database.name} {timeframe}: {error}")
                 continue
@@ -1124,12 +2260,11 @@ def scan_global_markets(
                         "Timeframe": timeframe,
                         "Pattern": candidate.pattern,
                         "Setup Stage": candidate.status,
+                        "Current Wave": current_wave_label(candidate),
                         "Direction": candidate.direction,
                         "Confidence Score": score.total,
                         "Invalidation Price": candidate.invalidation_level,
-                        "Fibonacci Target Zone": (
-                            f"{target_low:,.5f} – {target_high:,.5f}"
-                        ),
+                        "Fibonacci Target Zone": f"{target_low:,.5f} - {target_high:,.5f}",
                     }
                 )
     columns = (
@@ -1137,6 +2272,7 @@ def scan_global_markets(
         "Timeframe",
         "Pattern",
         "Setup Stage",
+        "Current Wave",
         "Direction",
         "Confidence Score",
         "Invalidation Price",
@@ -1144,9 +2280,7 @@ def scan_global_markets(
     )
     frame = pd.DataFrame(rows, columns=columns)
     if not frame.empty:
-        frame = frame.sort_values(
-            "Confidence Score", ascending=False, kind="stable"
-        ).reset_index(drop=True)
+        frame = frame.sort_values("Confidence Score", ascending=False, kind="stable").reset_index(drop=True)
     return frame, tuple(errors)
 
 
@@ -1158,42 +2292,35 @@ def _render_global_scanner() -> None:
         "Batch scan of every local market across every registered timeframe. "
         "Shows Forming watch candidates and confirmed EntryReady Wave 4/B setups."
     )
-    atr_multiplier = float(st.session_state.get("atr_multiplier", 2.0))
-    atr_period = int(st.session_state.get("atr_period", 14))
+    sensitivity = st.session_state.get("sensitivity_preset", "Balanced")
+    override_enabled = bool(st.session_state.get("advanced_atr_override", False))
+    atr_multiplier, atr_period = resolve_sensitivity(
+        sensitivity,
+        override_enabled=override_enabled,
+        atr_multiplier=float(st.session_state.get("atr_multiplier", 2.0)),
+        atr_period=int(st.session_state.get("atr_period", 14)),
+    )
     databases = discover_databases()
 
     status_col, action_col = st.columns([0.75, 0.25], vertical_alignment="center")
     with status_col:
         st.markdown(
-            f"<div class='terminal-panel'><span class='terminal-kicker'>"
-            f"Scan universe</span><div class='terminal-value'>"
-            f"{len(databases)} markets · {len(TIMEFRAMES)} timeframes · ATR "
-            f"{atr_period} × {atr_multiplier:.1f}</div></div>",
+            f"<div class='terminal-panel'><span class='terminal-kicker'>Scan universe</span>"
+            f"<div class='terminal-value'>{len(databases)} markets | {len(TIMEFRAMES)} timeframes | "
+            f"ATR {atr_period} x {atr_multiplier:.1f}</div></div>",
             unsafe_allow_html=True,
         )
     with action_col:
-        run_scan = st.button(
-            "Run market scan",
-            type="primary",
-            width="stretch",
-            disabled=not databases,
-        )
+        run_scan = st.button("Run market scan", type="primary", width="stretch", disabled=not databases)
 
     if not databases:
         st.info("No local asset databases were detected.")
         return
     if run_scan:
         with st.spinner("Scanning markets..."):
-            frame, errors = scan_global_markets(
-                databases, atr_multiplier, atr_period
-            )
+            frame, errors = scan_global_markets(databases, atr_multiplier, atr_period)
         st.session_state["scanner_frame"] = frame
         st.session_state["scanner_errors"] = errors
-        st.session_state["scanner_signature"] = (
-            tuple(str(path) for path in databases),
-            atr_multiplier,
-            atr_period,
-        )
 
     frame = st.session_state.get("scanner_frame")
     errors = st.session_state.get("scanner_errors", ())
@@ -1209,17 +2336,11 @@ def _render_global_scanner() -> None:
             width="stretch",
             height=min(680, 44 + 35 * len(frame)),
             column_config={
-                "Confidence Score": st.column_config.NumberColumn(
-                    format="%.2f"
-                ),
-                "Invalidation Price": st.column_config.NumberColumn(
-                    format="%.5f"
-                ),
+                "Confidence Score": st.column_config.NumberColumn(format="%.2f"),
+                "Invalidation Price": st.column_config.NumberColumn(format="%.5f"),
             },
         )
-        st.caption(
-            f"{len(frame)} active setups · sorted by Confidence Score"
-        )
+        st.caption(f"{len(frame)} active setups | sorted by Confidence Score")
     if errors:
         with st.expander(f"Skipped inputs ({len(errors)})", expanded=False):
             for error in errors:
@@ -1235,10 +2356,7 @@ def main() -> None:
         initial_sidebar_state="collapsed",
     )
     _inject_terminal_css(st)
-    terminal_tab, scanner_tab = st.tabs(
-        ("Single Chart Terminal", "Global Market Scanner"),
-        key="dashboard_view",
-    )
+    terminal_tab, scanner_tab = st.tabs(("Single Chart Terminal", "Global Market Scanner"))
     with terminal_tab:
         _render_single_chart()
     with scanner_tab:

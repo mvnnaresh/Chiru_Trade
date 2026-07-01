@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterable
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import time
 from pathlib import Path
@@ -44,6 +45,17 @@ ASSET_PROFILES: dict[str, AssetProfile] = {
         session_open=time(9, 15),
         session_close=time(15, 30),
     ),
+    "US_EQUITY": AssetProfile(
+        "US_EQUITY",
+        "America/New_York",
+        78,
+        5,
+        session_open=time(9, 30),
+        session_close=time(16, 0),
+    ),
+    "FOREX": AssetProfile("FOREX", "UTC", 288, 5),
+    # CME/NYMEX instruments normally pause for one hour each trading day.
+    "FUTURES": AssetProfile("FUTURES", "America/New_York", 276, 5),
 }
 
 
@@ -60,7 +72,7 @@ TIMEFRAMES: dict[str, TimeframeSpec] = {
 
 def setup_database(database: str | Path) -> None:
     """Create the canonical M5 candle table and its schema metadata."""
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS m5_candles (
@@ -98,7 +110,7 @@ def set_asset_profile(database: str | Path, profile: str) -> None:
         supported = "', '".join(ASSET_PROFILES)
         raise ValueError(f"asset profile must be one of '{supported}'")
     setup_database(database)
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
             ("asset_profile", profile_key),
@@ -108,7 +120,7 @@ def set_asset_profile(database: str | Path, profile: str) -> None:
 def get_asset_profile(database: str | Path) -> AssetProfile:
     """Resolve explicit profile metadata, with compatibility filename fallbacks."""
     setup_database(database)
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         row = connection.execute(
             "SELECT value FROM metadata WHERE key = 'asset_profile'"
         ).fetchone()
@@ -148,7 +160,7 @@ def ingest_m5(
         for timestamp, row in frame.iterrows()
     ]
 
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         before = connection.total_changes
         connection.executemany(
             """
@@ -182,7 +194,7 @@ def load_m5(
         "SELECT timestamp, open, high, low, close, volume "
         f"FROM m5_candles{where} ORDER BY timestamp"
     )
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         frame = pd.read_sql_query(query, connection, params=parameters)
 
     if frame.empty:

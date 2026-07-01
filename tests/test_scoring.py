@@ -135,7 +135,8 @@ def test_forming_impulse_uses_stage_specific_100_point_matrix(monkeypatch):
     assert result.fibonacci == 50
     assert result.momentum == 30
     assert result.channeling_alternation == 20
-    assert result.total == 100
+    assert result.total == 70
+    assert result.maturity_cap == 70
     assert sum(item.maximum for item in result.items) == 100
     assert all(
         "Wave 5" not in item.reason and "Wave C" not in item.reason
@@ -164,7 +165,8 @@ def test_entry_ready_zigzag_scores_only_available_a_and_b_evidence(monkeypatch):
     assert result.fibonacci == 50
     assert result.momentum == 30
     assert result.channeling_alternation == 20
-    assert result.total == 100
+    assert result.total == 90
+    assert result.maturity_cap == 90
     assert sum(item.maximum for item in result.items) == 100
     assert all("Wave C" not in item.reason for item in result.items)
 

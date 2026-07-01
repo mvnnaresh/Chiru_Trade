@@ -5,12 +5,15 @@ import pytest
 
 from engine import (
     WaveDAG,
+    active_candidate_sort_key,
     build_candidates,
+    candidate_observable_time,
     evaluate_flat,
     evaluate_impulse,
     evaluate_triangle,
     evaluate_zigzag,
     find_provisional_candidates,
+    select_active_primary,
 )
 from pivots import ActiveLeg, Pivot, PivotState
 
@@ -60,6 +63,19 @@ def test_each_absolute_rule_prunes_bullish_impulse(prices):
 @pytest.mark.parametrize(
     "prices",
     [
+        (100, 110, 100, 120, 112, 125),  # Wave 2 exactly 100%
+        (100, 110, 104, 110, 109, 125),  # Wave 3 fails to pass Wave 1
+        (100, 110, 104, 120, 104, 125),  # Wave 4 retraces 100% of Wave 3
+        (100, 110, 104, 120, 112, 119),  # Wave 5 truncation is excluded
+    ],
+)
+def test_standard_impulse_enforces_progress_and_retracement_boundaries(prices):
+    assert evaluate_impulse(bullish_impulse(prices)) is None
+
+
+@pytest.mark.parametrize(
+    "prices",
+    [
         (125, 115, 126, 105, 113, 100),
         (125, 115, 121, 113, 112, 100),
         (125, 115, 121, 105, 116, 100),
@@ -81,6 +97,19 @@ def test_valid_bullish_impulse_has_labels_rules_and_exact_floor():
     assert candidate.invalidation_side == "below"
     assert candidate.labeled_waves[4][0] == "4"
     assert candidate.status == "Completed"
+    assert {state.name for state in candidate.rule_states} == {
+        "wave_2_retracement",
+        "wave_3_beyond_wave_1",
+        "wave_3_not_shortest",
+        "wave_4_retracement",
+        "wave_4_no_overlap",
+        "wave_5_progress",
+    }
+    assert candidate.pivot_for_label("3") == candidate.pivots[3]
+    assert candidate.wave_span("2", "3") == (
+        candidate.pivots[2],
+        candidate.pivots[3],
+    )
 
 
 def test_forming_impulse_keeps_active_wave4_outside_confirmed_pivots():
@@ -118,6 +147,19 @@ def test_forming_impulse_is_pruned_on_wave1_territory_overlap():
     assert candidates == []
 
 
+def test_forming_impulse_requires_wave3_to_exceed_wave1():
+    confirmed = bullish_impulse((100, 110, 104, 109, 112, 125))[:4]
+    as_of = confirmed[-1].timestamp + pd.Timedelta(minutes=5)
+    active = ActiveLeg(as_of, 108.0, "Low", 2.0, "down")
+
+    candidates = find_provisional_candidates(
+        PivotState(as_of, confirmed, active),
+        include_zigzags=False,
+    )
+
+    assert candidates == []
+
+
 def test_confirmed_wave4_creates_entry_ready_impulse():
     confirmed = bullish_impulse()[:5]
     as_of = confirmed[-1].timestamp + pd.Timedelta(minutes=5)
@@ -133,6 +175,34 @@ def test_confirmed_wave4_creates_entry_ready_impulse():
     assert candidate.labels[-1] == "4"
     assert candidate.active_leg is None
     assert candidate.as_of == as_of
+
+
+def test_active_primary_prefers_latest_market_edge_and_entry_state():
+    confirmed = bullish_impulse()[:5]
+    entry_as_of = confirmed[-1].timestamp + pd.Timedelta(minutes=5)
+    entry_ready = find_provisional_candidates(
+        PivotState(entry_as_of, confirmed, None),
+        include_zigzags=False,
+    )[0]
+    newer_active = ActiveLeg(
+        entry_as_of + pd.Timedelta(minutes=5),
+        114.0,
+        "Low",
+        2.0,
+        "down",
+    )
+    forming = find_provisional_candidates(
+        PivotState(newer_active.timestamp, bullish_impulse()[:4], newer_active),
+        include_zigzags=False,
+    )[0]
+    completed = evaluate_impulse(bullish_impulse())
+
+    assert completed is not None
+    assert candidate_observable_time(forming) == newer_active.timestamp
+    assert active_candidate_sort_key(forming) < active_candidate_sort_key(
+        entry_ready
+    )
+    assert select_active_primary((completed, entry_ready, forming)) == forming
 
 
 def test_forming_and_entry_ready_zigzag_are_causal():
@@ -240,7 +310,36 @@ def test_abc_is_pruned_when_b_passes_a_origin():
     assert evaluate_zigzag(path) is None
 
 
-def test_valid_expanded_flat_has_labels_rules_and_b_invalidation():
+@pytest.mark.parametrize("c_price", [115, 105])
+def test_zigzag_is_pruned_when_c_fails_to_advance_beyond_a(c_price):
+    path = (
+        pivot(0, 120, "High"),
+        pivot(5, 100, "Low"),
+        pivot(10, 112, "High"),
+        pivot(15, c_price, "Low"),
+    )
+
+    assert evaluate_zigzag(path) is None
+
+
+def test_zigzag_rule_audit_includes_b_and_c_geometry():
+    path = (
+        pivot(0, 120, "High"),
+        pivot(5, 100, "Low"),
+        pivot(10, 112, "High"),
+        pivot(15, 90, "Low"),
+    )
+
+    candidate = evaluate_zigzag(path)
+
+    assert candidate is not None
+    assert [state.name for state in candidate.rule_states] == [
+        "wave_b_within_origin",
+        "wave_c_beyond_a",
+    ]
+
+
+def test_valid_running_flat_has_labels_rules_and_b_invalidation():
     path = (
         pivot(0, 120, "High"),
         pivot(5, 100, "Low"),
@@ -252,6 +351,7 @@ def test_valid_expanded_flat_has_labels_rules_and_b_invalidation():
 
     assert candidate is not None
     assert candidate.pattern == "Flat"
+    assert candidate.variant == "Running"
     assert candidate.labels == ("Start", "A", "B", "C")
     assert all(state.passed for state in candidate.rule_states)
     assert candidate.invalidation_level == 121
@@ -262,7 +362,7 @@ def test_valid_expanded_flat_has_labels_rules_and_b_invalidation():
     "prices",
     [
         (120, 100, 117, 101),  # B retraces only 85% of A
-        (120, 100, 121, 110),  # C terminates too far from A's extreme
+        (120, 100, 121, 110),  # Running C advances less than 61.8% of A
     ],
 )
 def test_flat_rules_prune_invalid_paths(prices):
@@ -273,6 +373,28 @@ def test_flat_rules_prune_invalid_paths(prices):
     )
 
     assert evaluate_flat(path) is None
+
+
+@pytest.mark.parametrize(
+    ("prices", "variant"),
+    [
+        ((120, 100, 119, 99), "Regular"),
+        ((120, 100, 124, 95), "Expanded"),
+        ((120, 100, 124, 103), "Running"),
+    ],
+)
+def test_flat_subtypes_are_classified_deterministically(prices, variant):
+    kinds = ("High", "Low", "High", "Low")
+    path = tuple(
+        pivot(index * 5, price, kind)
+        for index, (price, kind) in enumerate(zip(prices, kinds))
+    )
+
+    candidate = evaluate_flat(path)
+
+    assert candidate is not None
+    assert candidate.variant == variant
+    assert all(state.passed for state in candidate.rule_states)
 
 
 def test_valid_contracting_triangle_has_abcde_labels_and_invalidation():
@@ -289,6 +411,7 @@ def test_valid_contracting_triangle_has_abcde_labels_and_invalidation():
 
     assert candidate is not None
     assert candidate.pattern == "Triangle"
+    assert candidate.variant == "Contracting"
     assert candidate.labels == ("Start", "A", "B", "C", "D", "E")
     assert len(candidate.rule_states) == 4
     assert candidate.invalidation_level == 120
@@ -303,6 +426,35 @@ def test_triangle_is_pruned_when_any_leg_stops_contracting():
         pivot(15, 104, "Low"),
         pivot(20, 111, "High"),
         pivot(25, 103, "Low"),  # E=8 exceeds D=7
+    )
+
+    assert evaluate_triangle(path) is None
+
+
+def test_valid_barrier_triangle_has_horizontal_opposing_boundary():
+    path = (
+        pivot(0, 120, "High"),
+        pivot(5, 100, "Low"),
+        pivot(10, 114, "High"),
+        pivot(15, 104, "Low"),
+        pivot(20, 114, "High"),
+        pivot(25, 106, "Low"),
+    )
+
+    candidate = evaluate_triangle(path)
+
+    assert candidate is not None
+    assert candidate.variant == "Barrier"
+
+
+def test_expanding_triangle_boundaries_are_rejected():
+    path = (
+        pivot(0, 120, "High"),
+        pivot(5, 100, "Low"),
+        pivot(10, 114, "High"),
+        pivot(15, 98, "Low"),
+        pivot(20, 116, "High"),
+        pivot(25, 96, "Low"),
     )
 
     assert evaluate_triangle(path) is None
@@ -339,6 +491,48 @@ def test_non_alternating_nodes_break_paths_instead_of_being_skipped():
 
     assert (1, 2) not in graph.edges
     assert graph.candidates() == []
+
+
+def test_controlled_skip_recovers_alternate_path_and_records_node_indices():
+    original = bullish_impulse()
+    noisy = (
+        original[0],
+        original[1],
+        pivot(7, 109, "High"),
+        *original[2:],
+    )
+
+    adjacent = build_candidates(
+        noisy,
+        include_zigzags=False,
+        include_flats=False,
+        include_triangles=False,
+    )
+    alternates = build_candidates(
+        noisy,
+        include_zigzags=False,
+        include_flats=False,
+        include_triangles=False,
+        max_pivot_skip=1,
+        minimum_atr_displacement=1.0,
+    )
+
+    assert adjacent == []
+    recovered = next(
+        candidate
+        for candidate in alternates
+        if candidate.pivots == original
+    )
+    assert recovered.node_indices == (0, 1, 3, 4, 5, 6)
+
+
+def test_alternate_path_controls_are_validated():
+    with pytest.raises(ValueError, match="max_pivot_skip"):
+        build_candidates(bullish_impulse(), max_pivot_skip=-1)
+    with pytest.raises(ValueError, match="minimum_atr_displacement"):
+        build_candidates(
+            bullish_impulse(), minimum_atr_displacement=-0.1
+        )
 
 
 def test_outputs_are_immutable():

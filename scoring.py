@@ -28,6 +28,7 @@ class ConfidenceScore:
     channeling_alternation: float
     total: float
     items: tuple[ScoreItem, ...]
+    maturity_cap: float = 100.0
 
 
 def calculate_rsi(ohlcv: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -166,7 +167,9 @@ def _score_provisional_impulse(
             f"Wave 2={wave_2_depth:.4f}, Wave 4={wave_4_depth:.4f}",
         ),
     )
-    return _assemble_score(items)
+    return _assemble_score(
+        items, maturity_cap=70.0 if candidate.status == "Forming" else 90.0
+    )
 
 
 def _score_provisional_zigzag(
@@ -225,7 +228,9 @@ def _score_provisional_zigzag(
             f"{candidate.status} Wave B/A duration ratio={duration_ratio:.4f}",
         ),
     )
-    return _assemble_score(items)
+    return _assemble_score(
+        items, maturity_cap=70.0 if candidate.status == "Forming" else 90.0
+    )
 
 
 def _score_impulse(candidate: WaveCandidate, rsi: pd.Series) -> ConfidenceScore:
@@ -560,19 +565,22 @@ def _channel_error(candidate: WaveCandidate) -> float:
     return abs(pivots[4].price - projected) / scale
 
 
-def _assemble_score(items: tuple[ScoreItem, ...]) -> ConfidenceScore:
+def _assemble_score(
+    items: tuple[ScoreItem, ...], *, maturity_cap: float = 100.0
+) -> ConfidenceScore:
     fibonacci = min(50.0, sum(i.points for i in items if i.category == "Fibonacci Alignment"))
     momentum = min(30.0, sum(i.points for i in items if i.category == "Momentum Verification"))
     channeling = min(
         20.0, sum(i.points for i in items if i.category == "Channeling & Alternation")
     )
-    total = min(100.0, fibonacci + momentum + channeling)
+    total = min(maturity_cap, fibonacci + momentum + channeling)
     return ConfidenceScore(
         fibonacci=round(fibonacci, 4),
         momentum=round(momentum, 4),
         channeling_alternation=round(channeling, 4),
         total=round(total, 4),
         items=items,
+        maturity_cap=maturity_cap,
     )
 
 
