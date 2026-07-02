@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from backtester import Friction, build_causal_rankings, run_backtest
+from decision import DecisionState, build_decision_state
 from db import TIMEFRAMES, resample_ohlcv
 from engine import (
     WaveCandidate,
@@ -25,6 +27,7 @@ from engine import (
 from market_data import append_latest_m5, resolve_market_symbol
 from pivots import Pivot, PivotState, extract_pivot_state
 from scoring import ConfidenceScore, calculate_rsi, score_candidates
+from risk import RiskPolicy
 
 LOGGER = logging.getLogger("elliott_dashboard")
 COLORS = ("#00D4FF", "#FFB000", "#D65CFF")
@@ -32,6 +35,12 @@ SENSITIVITY_PRESETS: dict[str, tuple[float, int]] = {
     "Tight": (1.8, 10),
     "Balanced": (2.0, 14),
     "Conservative": (2.6, 21),
+}
+SIGNAL_STRICTNESS_THRESHOLDS: dict[str, float] = {
+    "Aggressive": 65.0,
+    "Balanced": 70.0,
+    "Conservative": 75.0,
+    "Very strict": 80.0,
 }
 LIVE_REFRESH_SECONDS: dict[str, int] = {"15s": 15, "30s": 30, "60s": 60}
 
@@ -85,6 +94,27 @@ def resolve_sensitivity(
     return resolved_multiplier, resolved_period
 
 
+def resolve_setup_quality_threshold(
+    strictness: str,
+    *,
+    override_enabled: bool = False,
+    override_value: float | None = None,
+) -> float:
+    """Resolve the single setup-quality gate used throughout the application."""
+    if strictness not in SIGNAL_STRICTNESS_THRESHOLDS:
+        raise ValueError(f"unknown signal strictness: {strictness}")
+    if not override_enabled:
+        return SIGNAL_STRICTNESS_THRESHOLDS[strictness]
+    value = (
+        SIGNAL_STRICTNESS_THRESHOLDS[strictness]
+        if override_value is None
+        else float(override_value)
+    )
+    if not 50 <= value <= 90:
+        raise ValueError("setup-quality threshold must be between 50 and 90")
+    return value
+
+
 def system_status(
     *,
     live_enabled: bool,
@@ -93,9 +123,9 @@ def system_status(
 ) -> tuple[str, str]:
     """Return a deterministic terminal status label and color."""
     if not live_enabled or not live_supported:
-        return "SYSTEM OFFLINE", "#F0B90B"
+        return "LOCAL DATA MODE", "#F0B90B"
     if live_refresh_ok is False:
-        return "SYSTEM OFFLINE", "#F05D68"
+        return "LIVE REFRESH ERROR", "#F05D68"
     return "SYSTEM LIVE", "#18C98B"
 
 
@@ -240,6 +270,36 @@ def log_alert_background(message: str) -> threading.Thread:
     )
     thread.start()
     return thread
+
+
+def emit_alert_shell(
+    candidate: WaveCandidate | None,
+    score: ConfidenceScore | None,
+    _bot_token: str = "",
+    chat_id: str = "",
+) -> bool:
+    """Validate and write an eligible setup alert to application logs only."""
+    import streamlit as st
+
+    if candidate is None or score is None:
+        st.warning("No candidate is selected for an alert.")
+        return False
+    threshold = float(
+        st.session_state.get("resolved_setup_quality_threshold", 70.0)
+    )
+    if not _is_tradeable_setup(candidate):
+        st.warning("The selected candidate is not a confirmed Wave 4/B setup.")
+        return False
+    if score.total < threshold:
+        st.warning("The selected setup is below the alert setup-quality threshold.")
+        return False
+    message = format_setup_alert(candidate, score, threshold, chat_id=chat_id)
+    if message is None:
+        st.warning("The selected setup is not eligible for an alert.")
+        return False
+    log_alert_background(message)
+    st.success("Setup written to application logs.")
+    return True
 
 
 def build_lightweight_charts(
@@ -432,15 +492,22 @@ def marker_status(
     if not enabled:
         return threshold_text, "Overlay disabled", "Overlay disabled"
     if not tradeable:
-        if enabled[0][0].status == "Forming":
-            label = f"Forming Wave {enabled[0][0].forming_label}"
-            return threshold_text, label, label
-        return threshold_text, "Awaiting Wave 4/B", "Awaiting Wave 4/B"
+        candidate = enabled[0][0]
+        label = (
+            f"Forming Wave {candidate.forming_label}"
+            if candidate.status == "Forming"
+            else "Awaiting Wave 4/B"
+        )
+        if candidate.direction == "Bullish":
+            return threshold_text, label, "No bearish setup"
+        return threshold_text, "No bullish setup", label
 
     candidate, score = tradeable[0]
     if score.total < alert_threshold:
         message = f"Below threshold ({score.total:.1f})"
-        return threshold_text, message, message
+        if candidate.direction == "Bullish":
+            return threshold_text, message, "No bearish setup"
+        return threshold_text, "No bullish setup", message
 
     entry = f"{candidate.pivots[-1].price:,.2f}"
     if candidate.direction == "Bullish":
@@ -536,8 +603,79 @@ def trader_recommendation(
         status_text=f"{candidate.pattern} | {current_wave_label(candidate)}",
         rationale=(
             "Terminal Wave 4/B is present and active.",
-            "Confidence gate is passed.",
+            "Setup quality gate is passed.",
         ),
+    )
+
+
+def decision_panel_markup(decision: DecisionState) -> str:
+    """Return the decision-first panel without coupling decision logic to Streamlit."""
+    def price(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:,.2f}"
+
+    provisional = decision.status == "WATCH"
+    target_1_label = "Provisional target 1" if provisional else "Target 1"
+    target_2_label = "Provisional target 2" if provisional else "Target 2"
+    if decision.status == "WATCH" and decision.stage == "Forming":
+        action = "Do not trade yet. Wait for Wave 4/B confirmation."
+    elif decision.status == "WATCH":
+        action = "Do not trade yet. Wait for stronger confirmation."
+    elif decision.status == "NO TRADE":
+        action = "Do not enter from this setup. Wait for a new Wave 4/B setup."
+    elif decision.status == "BLOCKED":
+        action = "Do not trade under the current risk policy."
+    else:
+        action = "Review manually before placing any order."
+    structure_status = (
+        "WATCHLIST SETUP"
+        if decision.stage == "Forming"
+        else f"{'BUY' if decision.direction == 'Bullish' else 'SELL'} SETUP"
+        if decision.direction in {"Bullish", "Bearish"}
+        and decision.stage == "EntryReady"
+        else "NO ACTIVE SETUP"
+    )
+    trade_direction = (
+        decision.direction.upper()
+        if decision.stage == "Forming" and decision.direction in {"Bullish", "Bearish"}
+        else "BUY" if decision.direction == "Bullish"
+        else "SELL" if decision.direction == "Bearish"
+        else "n/a"
+    )
+
+    fields = (
+        ("Structure status", structure_status),
+        ("Trade decision", decision.status),
+        ("Direction", trade_direction),
+        ("Stage", decision.stage or "n/a"),
+        ("Lifecycle", decision.lifecycle or "n/a"),
+        ("Current price", price(decision.current_price)),
+        ("Entry reference", price(decision.entry_reference)),
+        ("Setup pivot reference", price(decision.setup_reference)),
+        ("Stop / invalidation", price(decision.stop)),
+        (target_1_label, price(decision.target_1)),
+        (target_2_label, price(decision.target_2)),
+        ("Reward/risk", "n/a" if decision.reward_risk is None else f"{decision.reward_risk:.2f}"),
+        ("Position size", "n/a" if decision.units is None else f"{decision.units:,} units"),
+        ("Total risk", price(decision.total_risk)),
+        ("Setup Quality Score", "n/a" if decision.setup_quality_score is None else f"{decision.setup_quality_score:.1f} / 100"),
+        ("Required Threshold", "n/a" if decision.required_threshold is None else f"{decision.required_threshold:.1f}"),
+        ("Quality Gate Result", decision.quality_gate_result),
+        ("Risk gate result", decision.risk_reason),
+    )
+    cells = "".join(
+        "<div><div class='terminal-kicker'>"
+        f"{html.escape(label)}</div><div class='terminal-value'>{html.escape(value)}</div></div>"
+        for label, value in fields
+    )
+    return (
+        "<div class='terminal-panel' style='border-width:2px;margin-bottom:.5rem'>"
+        "<div class='terminal-kicker'>Decision status</div>"
+        f"<div style='font-size:1.55rem;font-weight:800;color:{decision.color}'>{html.escape(decision.status)}</div>"
+        f"<div style='color:#F4F7FA;margin:.3rem 0'>{html.escape(decision.reason)}</div>"
+        f"<div style='color:#8c96a5;font-size:.8rem'>{html.escape(decision.second_reason)}</div>"
+        f"<div style='color:#F4F7FA;font-weight:700;margin-top:.5rem'>Action: {html.escape(action)}</div>"
+        "<div style='display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:.7rem;margin-top:.8rem'>"
+        f"{cells}</div></div>"
     )
 
 
@@ -557,6 +695,7 @@ def system_hints(
     score: ConfidenceScore,
     alert_threshold: float,
     lifecycle: str,
+    decision_state: DecisionState | None = None,
 ) -> tuple[str, ...]:
     """Explain every gate controlling an actionable chart marker."""
     terminal = candidate.labels[-1] if candidate.labels else "unknown"
@@ -565,9 +704,9 @@ def system_hints(
         "floor" if candidate.invalidation_side == "below" else "ceiling"
     )
     confidence = (
-        f"Confidence gate: Passed ({score.total:.1f} >= {alert_threshold:.1f})"
+        f"Setup quality gate: Passed ({score.total:.1f} >= {alert_threshold:.1f})"
         if score.total >= alert_threshold
-        else f"Confidence gate: Below threshold "
+        else f"Setup quality gate: Below threshold "
         f"({score.total:.1f} < {alert_threshold:.1f})"
     )
     hints = [
@@ -588,10 +727,11 @@ def system_hints(
         hints.extend(
             (
                 "Entry gate: Pending - Wave 4/B endpoint is not confirmed",
+                "Risk gate: Not evaluated because setup is not confirmed",
                 "Marker decision: Hidden - forming structures are watch-only",
                 f"Next required event: Confirm the provisional Wave "
                 f"{candidate.forming_label} pivot",
-                "Trading interpretation: Watchlist candidate; "
+                "Trading interpretation: Watchlist setup; "
                 "not a current trade signal",
             )
         )
@@ -623,24 +763,49 @@ def system_hints(
         hints.extend(
             (
                 "Entry gate: Passed - terminal Wave 4/B is present",
-                "Marker decision: Hidden - confidence gate not met",
-                f"Next required event: Confidence must reach "
+                "Risk gate: Not evaluated below the setup quality threshold",
+                "Marker decision: Hidden - setup quality gate not met",
+                f"Next required event: Setup quality must reach "
                 f"{alert_threshold:.1f}",
                 "Trading interpretation: Structurally actionable but "
                 "insufficiently ranked",
             )
         )
     else:
-        side = "Buy" if candidate.direction == "Bullish" else "Sell"
-        hints.extend(
-            (
-                "Entry gate: Passed - terminal Wave 4/B is present",
-                f"Marker decision: Visible - {side} at "
-                f"{candidate.pivots[-1].price:,.2f}",
-                "Next required event: Monitor target and invalidation",
-                f"Trading interpretation: Actionable {side.lower()} setup",
+        side = "BUY" if candidate.direction == "Bullish" else "SELL"
+        setup_reference = _setup_endpoint(candidate)[1]
+        if decision_state is not None and decision_state.status == "BLOCKED":
+            hints.extend(
+                (
+                    "Entry gate: Passed - terminal Wave 4/B is present",
+                    f"Risk gate: Failed - {decision_state.risk_reason}",
+                    f"Marker decision: {side} setup detected, but trade blocked by risk policy",
+                    f"{side} setup pivot: {setup_reference:,.2f}",
+                    "Next required event: Risk policy must approve the setup",
+                    "Trading interpretation: Valid structure, not tradable under current risk settings",
+                )
             )
-        )
+        elif decision_state is not None and decision_state.status == "TRADE READY":
+            hints.extend(
+                (
+                    "Entry gate: Passed - terminal Wave 4/B is present",
+                    "Risk gate: Passed",
+                    f"Marker decision: {side} setup ready",
+                    f"{side} setup pivot: {setup_reference:,.2f}",
+                    "Next required event: Review entry, target, and invalidation",
+                    f"Trading interpretation: Trade-ready {side.lower()} setup under current risk policy",
+                )
+            )
+        else:
+            hints.extend(
+                (
+                    "Entry gate: Passed - terminal Wave 4/B is present",
+                    "Risk gate: Not evaluated",
+                    f"Marker decision: {side} setup present",
+                    f"{side} setup pivot: {setup_reference:,.2f}",
+                    "Trading interpretation: Structure ready; trade decision not evaluated",
+                )
+            )
     hints.extend(
         (
             f"Invalidation reference: {candidate.invalidation_level:,.2f} "
@@ -918,7 +1083,7 @@ def candidate_lifecycle(
     """Classify a path using only candles after its causal detection point."""
     if candidate.status == "Forming":
         return "Forming"
-    observable_at = candidate.as_of or candidate.pivots[-1].timestamp
+    observable_at = tradeable_signal_time(candidate)
     future = candles.loc[candles.index > observable_at]
     if future.empty:
         return "Active"
@@ -940,6 +1105,18 @@ def candidate_lifecycle(
         if target_hit:
             return "Target hit"
     return "Active"
+
+
+def tradeable_signal_time(candidate: WaveCandidate) -> pd.Timestamp:
+    """Return the pivot time from which a tradeable setup must be monitored."""
+    if candidate.status == "EntryReady":
+        for label in ("4", "B"):
+            pivot = candidate.pivot_for_label(label)
+            if pivot is not None:
+                return pivot.timestamp
+    if candidate.status == "Forming" and candidate.active_leg is not None:
+        return candidate.active_leg.timestamp
+    return candidate.pivots[-1].timestamp
 
 
 def actionable_rankings(
@@ -1300,6 +1477,77 @@ def _render_single_chart_fragmented() -> None:
             atr_period=int(atr_period_input),
         )
         st.caption(f"Resolved engine settings: ATR {atr_period} x {atr_multiplier:.1f}")
+        strictness = st.selectbox(
+            "Signal Strictness",
+            tuple(SIGNAL_STRICTNESS_THRESHOLDS),
+            index=tuple(SIGNAL_STRICTNESS_THRESHOLDS).index("Balanced"),
+            key="signal_strictness",
+        )
+        quality_override = st.checkbox(
+            "Override setup-quality threshold",
+            value=False,
+            key="override_setup_quality_threshold",
+        )
+        quality_override_value: float | None = None
+        if quality_override:
+            quality_override_value = st.slider(
+                "Setup Quality Threshold",
+                min_value=50.0,
+                max_value=90.0,
+                value=float(SIGNAL_STRICTNESS_THRESHOLDS[strictness]),
+                step=0.5,
+                key="setup_quality_threshold_override",
+            )
+        resolved_setup_quality_threshold = resolve_setup_quality_threshold(
+            strictness,
+            override_enabled=quality_override,
+            override_value=quality_override_value,
+        )
+        st.session_state["resolved_setup_quality_threshold"] = (
+            resolved_setup_quality_threshold
+        )
+        st.caption(
+            f"Resolved setup-quality threshold: {resolved_setup_quality_threshold:.1f}"
+        )
+
+    risk_policy: RiskPolicy | None = None
+    friction: Friction | None = None
+    with st.expander("Risk Settings", expanded=False):
+        risk_cols = st.columns(3)
+        with risk_cols[0]:
+            account_equity = st.number_input("Account equity", value=100000.0, min_value=0.0)
+            risk_per_trade = st.number_input("Risk per trade %", value=1.0, min_value=0.0)
+            maximum_open_risk = st.number_input("Maximum open risk %", value=3.0, min_value=0.0)
+            maximum_daily_loss = st.number_input("Maximum daily loss %", value=3.0, min_value=0.0)
+        with risk_cols[1]:
+            minimum_reward_risk = st.number_input("Minimum reward/risk", value=1.5, min_value=0.0)
+            lot_size = st.number_input("Lot size", value=1, min_value=1, step=1)
+            current_open_risk = st.number_input("Current open risk", value=0.0, min_value=0.0)
+            realized_daily_loss = st.number_input("Realized daily loss", value=0.0, min_value=0.0)
+        with risk_cols[2]:
+            spread = st.number_input("Spread", value=0.0, min_value=0.0)
+            slippage = st.number_input("Slippage", value=0.0, min_value=0.0)
+            commission = st.number_input("Commission", value=0.0, min_value=0.0)
+        try:
+            risk_policy = RiskPolicy(
+                account_equity=float(account_equity),
+                risk_per_trade_percent=float(risk_per_trade),
+                maximum_open_risk_percent=float(maximum_open_risk),
+                maximum_daily_loss_percent=float(maximum_daily_loss),
+                minimum_reward_risk=float(minimum_reward_risk),
+                lot_size=int(lot_size),
+            )
+            friction = Friction(
+                spread=float(spread),
+                slippage=float(slippage),
+                commission=float(commission),
+            )
+            st.session_state["active_risk_policy"] = risk_policy
+            st.session_state["active_friction"] = friction
+            st.session_state["active_current_open_risk"] = float(current_open_risk)
+            st.session_state["active_realized_daily_loss"] = float(realized_daily_loss)
+        except (TypeError, ValueError) as error:
+            st.warning(f"Invalid risk settings: {error}")
 
     if selected_database is not None:
         query["market"] = selected_database.name
@@ -1447,7 +1695,7 @@ def _render_single_chart_fragmented() -> None:
         )
 
         top_rankings = display_rankings[:3]
-        alert_threshold = float(st.session_state.get("alert_threshold", 75.0))
+        alert_threshold = resolved_setup_quality_threshold
         chart_col, inspector_col = st.columns([4.9, 1.45], gap="medium")
 
         selected_candidate = top_rankings[0][0] if top_rankings else None
@@ -1513,6 +1761,17 @@ def _render_single_chart_fragmented() -> None:
                 )
                 query["focus_selected"] = "1" if focus_selected else "0"
                 lifecycle = candidate_lifecycle(selected_candidate, result.candles)
+                inspector_decision = build_decision_state(
+                    selected_candidate,
+                    selected_score,
+                    alert_threshold,
+                    lifecycle,
+                    result.candles,
+                    risk_policy,
+                    friction,
+                    current_open_risk=float(current_open_risk),
+                    realized_daily_loss=float(realized_daily_loss),
+                )
                 target_low, target_high = target_zone(selected_candidate)
                 st.markdown(
                     f"""
@@ -1526,7 +1785,7 @@ def _render_single_chart_fragmented() -> None:
                         </div>
                     </div>
                     <div class='terminal-panel'>
-                        <div class='terminal-kicker'>Confidence Score</div>
+                        <div class='terminal-kicker'>Setup Quality Score</div>
                         <div class='terminal-value'>{selected_score.total:.1f} / 100</div>
                     </div>
                     <div class='terminal-panel'>
@@ -1534,7 +1793,7 @@ def _render_single_chart_fragmented() -> None:
                         <div class='terminal-value negative'>{selected_candidate.invalidation_level:,.2f}</div>
                     </div>
                     <div class='terminal-panel'>
-                        <div class='terminal-kicker'>Fibonacci target zone</div>
+                        <div class='terminal-kicker'>Planning target zone</div>
                         <div class='terminal-value positive'>{target_low:,.2f} - {target_high:,.2f}</div>
                     </div>
                     <div class='terminal-panel'>
@@ -1573,6 +1832,7 @@ def _render_single_chart_fragmented() -> None:
                     selected_score,
                     alert_threshold,
                     lifecycle=lifecycle,
+                    decision_state=inspector_decision,
                 ):
                     label, _, value = hint.partition(": ")
                     if not value:
@@ -1608,6 +1868,23 @@ def _render_single_chart_fragmented() -> None:
         with chart_col:
             legend_candidate = selected_candidate if top_rankings else None
             st.markdown(_legend_markup(top_rankings, overlays, legend_candidate), unsafe_allow_html=True)
+            selected_lifecycle = (
+                candidate_lifecycle(selected_candidate, result.candles)
+                if selected_candidate is not None
+                else None
+            )
+            decision = build_decision_state(
+                selected_candidate,
+                selected_score,
+                alert_threshold,
+                selected_lifecycle,
+                result.candles,
+                risk_policy,
+                friction,
+                current_open_risk=float(current_open_risk),
+                realized_daily_loss=float(realized_daily_loss),
+            )
+            st.markdown(decision_panel_markup(decision), unsafe_allow_html=True)
             if selected_candidate is not None and selected_score is not None:
                 threshold_text, buy_text, sell_text = marker_status(
                     top_rankings,
@@ -1618,9 +1895,9 @@ def _render_single_chart_fragmented() -> None:
                 threshold_text, buy_text, sell_text = ("n/a", "n/a", "n/a")
             st.markdown(
                 "<div class='terminal-panel' style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:.8rem'>"
-                f"<div><div class='terminal-kicker'>Marker threshold</div><div class='terminal-value'>{threshold_text}</div></div>"
-                f"<div><div class='terminal-kicker'>Buy at</div><div class='terminal-value positive'>{html.escape(buy_text)}</div></div>"
-                f"<div><div class='terminal-kicker'>Sell at</div><div class='terminal-value negative'>{html.escape(sell_text)}</div></div>"
+                f"<div><div class='terminal-kicker'>Setup quality threshold</div><div class='terminal-value'>{threshold_text}</div></div>"
+                f"<div><div class='terminal-kicker'>Bullish setup ref</div><div class='terminal-value positive'>{html.escape(buy_text)}</div></div>"
+                f"<div><div class='terminal-kicker'>Bearish setup ref</div><div class='terminal-value negative'>{html.escape(sell_text)}</div></div>"
                 "</div>",
                 unsafe_allow_html=True,
             )
@@ -1642,49 +1919,6 @@ def _render_single_chart_fragmented() -> None:
                     f"{pattern_view}-{sensitivity}-{effective_live_mode}"
                 ),
             )
-            selected_lifecycle = (
-                candidate_lifecycle(selected_candidate, result.candles)
-                if selected_candidate is not None
-                else None
-            )
-            recommendation = trader_recommendation(
-                selected_candidate,
-                selected_score,
-                alert_threshold,
-                selected_lifecycle,
-            )
-            st.markdown(
-                f"""
-                <div class='terminal-panel' style='margin-top:.35rem'>
-                    <div style='display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;flex-wrap:wrap'>
-                        <div style='min-width:180px'>
-                            <div class='terminal-kicker'>Trader-facing mode</div>
-                            <div style='font-size:1.2rem;font-weight:750;color:{recommendation.color};margin-top:.15rem'>{html.escape(recommendation.action)}</div>
-                            <div style='color:#F4F7FA;font-size:.82rem;margin-top:.15rem'>{html.escape(recommendation.status_text)}</div>
-                        </div>
-                        <div style='display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:.85rem;flex:1;min-width:300px'>
-                            <div>
-                                <div class='terminal-kicker'>Entry</div>
-                                <div class='terminal-value'>{html.escape(recommendation.entry_text)}</div>
-                            </div>
-                            <div>
-                                <div class='terminal-kicker'>Stop</div>
-                                <div class='terminal-value negative'>{html.escape(recommendation.stop_text)}</div>
-                            </div>
-                            <div>
-                                <div class='terminal-kicker'>Target zone</div>
-                                <div class='terminal-value positive'>{html.escape(recommendation.target_text)}</div>
-                            </div>
-                        </div>
-                    </div>
-                    <div style='display:grid;grid-template-columns:1fr 1fr;gap:.55rem;margin-top:.65rem'>
-                        <div style='color:#F4F7FA;font-size:.8rem'><strong>Reason 1:</strong> {html.escape(recommendation.rationale[0])}</div>
-                        <div style='color:#F4F7FA;font-size:.8rem'><strong>Reason 2:</strong> {html.escape(recommendation.rationale[1])}</div>
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
 
         history_col, operations_col = st.columns([0.7, 0.3], gap="medium")
         with history_col:
@@ -1704,6 +1938,56 @@ def _render_single_chart_fragmented() -> None:
                         for index, (candidate, score) in enumerate(scoped_rankings[:25])
                     ]
                     st.dataframe(pd.DataFrame(history_rows), hide_index=True, width="stretch")
+            with st.expander("Historical Evidence", expanded=False):
+                st.caption(
+                    "Causal historical results are descriptive evidence, not a probability of profit."
+                )
+                if st.button("Run evidence check", key="run_evidence_check"):
+                    try:
+                        with st.spinner("Building causal historical rankings..."):
+                            historical_rankings = build_causal_rankings(
+                                result.candles,
+                                multiplier=atr_multiplier,
+                                atr_period=atr_period,
+                            )
+                            evidence = run_backtest(
+                                result.candles,
+                                historical_rankings,
+                                minimum_confidence=alert_threshold,
+                                friction=friction or Friction(),
+                            )
+                        st.session_state["historical_evidence"] = evidence
+                    except (ValueError, IndexError) as error:
+                        st.session_state["historical_evidence"] = None
+                        st.warning(f"Insufficient historical evidence: {error}")
+                evidence = st.session_state.get("historical_evidence")
+                if evidence is not None:
+                    evidence_cols = st.columns(4)
+                    evidence_cols[0].metric("Total trades", evidence.total_trades)
+                    evidence_cols[1].metric("Win rate", f"{evidence.win_rate:.1f}%")
+                    evidence_cols[2].metric("Net P/L", f"{evidence.net_profit_loss:,.2f}")
+                    evidence_cols[3].metric("Maximum drawdown", f"{evidence.maximum_drawdown:,.2f}")
+                    if evidence.ledger:
+                        st.dataframe(
+                            pd.DataFrame(
+                                [
+                                    {
+                                        "Direction": trade.direction,
+                                        "Entry time": trade.entry_time,
+                                        "Exit time": trade.exit_time,
+                                        "Entry": trade.entry_price,
+                                        "Exit": trade.exit_price,
+                                        "Result": trade.exit_reason,
+                                        "Net P/L": trade.net_pnl,
+                                    }
+                                    for trade in evidence.ledger[-10:]
+                                ]
+                            ),
+                            hide_index=True,
+                            width="stretch",
+                        )
+                    else:
+                        st.info("Insufficient historical evidence")
 
         with operations_col:
             with st.expander("Alerts & operations", expanded=False):
@@ -1735,13 +2019,8 @@ def _render_single_chart_fragmented() -> None:
                         key="telegram_chat_id",
                         autocomplete="off",
                     )
-                st.slider(
-                    "Alert Confidence Score",
-                    min_value=0.0,
-                    max_value=100.0,
-                    value=float(st.session_state.get("alert_threshold", 75.0)),
-                    step=0.5,
-                    key="alert_threshold",
+                st.caption(
+                    f"Setup quality threshold: {alert_threshold:.1f}"
                 )
                 if st.button(
                     "Emit local alert shell",
@@ -1757,6 +2036,8 @@ def _render_single_chart() -> None:
     _render_single_chart_fragmented()
     return
 
+    # TODO: Remove this legacy duplicate after downstream UI snapshot users migrate.
+    # It is unreachable; the maintained implementation is the fragmented renderer above.
     import streamlit as st
     import streamlit.components.v1 as components
     from streamlit_lightweight_charts import renderLightweightCharts
@@ -2285,10 +2566,106 @@ def _has_completed_trade_setup(candidate: WaveCandidate) -> bool:
     return _is_tradeable_setup(candidate)
 
 
+def scanner_candidate_row(
+    *,
+    market: str,
+    timeframe: str,
+    candidate: WaveCandidate,
+    score: ConfidenceScore,
+    candles: pd.DataFrame,
+    setup_quality_threshold: float,
+    risk_policy: RiskPolicy | None,
+    friction: Friction | None,
+    current_open_risk: float = 0.0,
+    realized_daily_loss: float = 0.0,
+    evaluate_risk: bool = True,
+) -> dict[str, object]:
+    """Classify one scanner row with the same structure and risk gates as the terminal."""
+    lifecycle = candidate_lifecycle(candidate, candles)
+    direction = "BUY" if candidate.direction == "Bullish" else "SELL"
+    target_low, target_high = target_zone(candidate)
+    risk_reward: float | str = "Not evaluated"
+
+    if candidate.status == "Forming":
+        trade_decision, structure_status, reason = (
+            "WATCH", "WATCHLIST", "Forming structure"
+        )
+    elif lifecycle == "Invalidated":
+        trade_decision, structure_status, reason = (
+            "NO TRADE", "HISTORICAL", "Invalidated"
+        )
+    elif lifecycle == "Target hit":
+        trade_decision, structure_status, reason = (
+            "NO TRADE", "HISTORICAL", "Target hit"
+        )
+    elif candidate.status == "Completed":
+        trade_decision, structure_status, reason = (
+            "NO TRADE", "HISTORICAL", "Completed historical structure"
+        )
+    elif not _is_tradeable_setup(candidate):
+        trade_decision, structure_status, reason = (
+            "NO TRADE", "HISTORICAL", "Not at tradeable Wave 4/B"
+        )
+    else:
+        structure_status = f"{direction} SETUP"
+        if score.total < setup_quality_threshold:
+            trade_decision, reason = "WATCH", "Quality below threshold"
+        elif not evaluate_risk:
+            trade_decision, reason = "WATCH", "Needs risk check"
+        else:
+            decision = build_decision_state(
+                candidate,
+                score,
+                setup_quality_threshold,
+                lifecycle,
+                candles,
+                risk_policy,
+                friction,
+                current_open_risk=current_open_risk,
+                realized_daily_loss=realized_daily_loss,
+            )
+            risk_reward = (
+                decision.reward_risk
+                if decision.reward_risk is not None
+                else "Not evaluated"
+            )
+            if decision.status == "TRADE READY":
+                trade_decision, reason = (
+                    "TRADE READY", "Quality passed and risk approved"
+                )
+            elif decision.status == "BLOCKED":
+                trade_decision = "BLOCKED"
+                reason = f"Risk failed: {decision.risk_reason}"
+            else:
+                trade_decision = decision.status
+                reason = decision.reason
+
+    return {
+        "Trade Decision": trade_decision,
+        "Structure Status": structure_status,
+        "Direction": direction,
+        "Reason": reason,
+        "Setup Quality Score": float(score.total),
+        "Risk/Reward": risk_reward,
+        "Market": market,
+        "Timeframe": timeframe,
+        "Pattern": candidate.pattern,
+        "Current Wave": current_wave_label(candidate),
+        "Invalidation": float(candidate.invalidation_level),
+        "Target Zone": f"{target_low:,.5f} - {target_high:,.5f}",
+    }
+
+
 def scan_global_markets(
     databases: tuple[Path, ...],
     atr_multiplier: float,
     atr_period: int,
+    setup_quality_threshold: float = 70.0,
+    risk_policy: RiskPolicy | None = None,
+    friction: Friction | None = None,
+    current_open_risk: float = 0.0,
+    realized_daily_loss: float = 0.0,
+    evaluate_risk: bool = True,
 ) -> tuple[pd.DataFrame, tuple[str, ...]]:
     """Scan every asset/timeframe without mutating terminal state."""
     rows: list[dict[str, object]] = []
@@ -2308,39 +2685,50 @@ def scan_global_markets(
                 errors.append(f"{database.name} {timeframe}: {error}")
                 continue
             for candidate, score in result.rankings:
-                if candidate.status not in {"Forming", "EntryReady"}:
-                    continue
-                lifecycle = candidate_lifecycle(candidate, result.candles)
-                if lifecycle not in {"Forming", "Active"}:
-                    continue
-                target_low, target_high = target_zone(candidate)
                 rows.append(
-                    {
-                        "Market": database.stem,
-                        "Timeframe": timeframe,
-                        "Pattern": candidate.pattern,
-                        "Setup Stage": candidate.status,
-                        "Current Wave": current_wave_label(candidate),
-                        "Direction": candidate.direction,
-                        "Confidence Score": score.total,
-                        "Invalidation Price": candidate.invalidation_level,
-                        "Fibonacci Target Zone": f"{target_low:,.5f} - {target_high:,.5f}",
-                    }
+                    scanner_candidate_row(
+                        market=database.stem,
+                        timeframe=timeframe,
+                        candidate=candidate,
+                        score=score,
+                        candles=result.candles,
+                        setup_quality_threshold=setup_quality_threshold,
+                        risk_policy=risk_policy,
+                        friction=friction,
+                        current_open_risk=current_open_risk,
+                        realized_daily_loss=realized_daily_loss,
+                        evaluate_risk=evaluate_risk,
+                    )
                 )
     columns = (
+        "Trade Decision",
+        "Structure Status",
+        "Direction",
+        "Reason",
+        "Setup Quality Score",
+        "Risk/Reward",
         "Market",
         "Timeframe",
         "Pattern",
-        "Setup Stage",
         "Current Wave",
-        "Direction",
-        "Confidence Score",
-        "Invalidation Price",
-        "Fibonacci Target Zone",
+        "Invalidation",
+        "Target Zone",
     )
     frame = pd.DataFrame(rows, columns=columns)
     if not frame.empty:
-        frame = frame.sort_values("Confidence Score", ascending=False, kind="stable").reset_index(drop=True)
+        decision_order = {
+            "TRADE READY": 0, "BLOCKED": 1, "WATCH": 2, "NO TRADE": 3
+        }
+        frame["_decision_order"] = frame["Trade Decision"].map(decision_order)
+        frame = (
+            frame.sort_values(
+                ["_decision_order", "Setup Quality Score"],
+                ascending=[True, False],
+                kind="stable",
+            )
+            .drop(columns="_decision_order")
+            .reset_index(drop=True)
+        )
     return frame, tuple(errors)
 
 
@@ -2361,6 +2749,27 @@ def _render_global_scanner() -> None:
         atr_period=int(st.session_state.get("atr_period", 14)),
     )
     databases = discover_databases()
+    setup_quality_threshold = float(
+        st.session_state.get("resolved_setup_quality_threshold", 70.0)
+    )
+    risk_policy = st.session_state.get(
+        "active_risk_policy", RiskPolicy(account_equity=100_000)
+    )
+    friction = st.session_state.get("active_friction", Friction())
+    current_open_risk = float(
+        st.session_state.get("active_current_open_risk", 0.0)
+    )
+    realized_daily_loss = float(
+        st.session_state.get("active_realized_daily_loss", 0.0)
+    )
+    evaluate_risk = st.checkbox(
+        "Evaluate risk in scanner",
+        value=True,
+        help=(
+            "Uses the active Risk Settings. Disable to classify quality-passed "
+            "setups as WATCH until risk is checked."
+        ),
+    )
 
     status_col, action_col = st.columns([0.75, 0.25], vertical_alignment="center")
     with status_col:
@@ -2378,7 +2787,17 @@ def _render_global_scanner() -> None:
         return
     if run_scan:
         with st.spinner("Scanning markets..."):
-            frame, errors = scan_global_markets(databases, atr_multiplier, atr_period)
+            frame, errors = scan_global_markets(
+                databases,
+                atr_multiplier,
+                atr_period,
+                setup_quality_threshold,
+                risk_policy,
+                friction,
+                current_open_risk,
+                realized_daily_loss,
+                evaluate_risk,
+            )
         st.session_state["scanner_frame"] = frame
         st.session_state["scanner_errors"] = errors
 
@@ -2390,17 +2809,26 @@ def _render_global_scanner() -> None:
     if frame.empty:
         st.warning("No active Wave 4 or Wave B trade setups were found.")
     else:
+        counts = frame["Trade Decision"].value_counts()
+        summary_cols = st.columns(4)
+        summary_cols[0].metric("Trade ready", int(counts.get("TRADE READY", 0)))
+        summary_cols[1].metric("Blocked", int(counts.get("BLOCKED", 0)))
+        summary_cols[2].metric("Watch", int(counts.get("WATCH", 0)))
+        summary_cols[3].metric("No trade", int(counts.get("NO TRADE", 0)))
         st.dataframe(
             frame,
             hide_index=True,
             width="stretch",
             height=min(680, 44 + 35 * len(frame)),
             column_config={
-                "Confidence Score": st.column_config.NumberColumn(format="%.2f"),
-                "Invalidation Price": st.column_config.NumberColumn(format="%.5f"),
+                "Setup Quality Score": st.column_config.NumberColumn(format="%.2f"),
+                "Invalidation": st.column_config.NumberColumn(format="%.5f"),
             },
         )
-        st.caption(f"{len(frame)} active setups | sorted by Confidence Score")
+        st.caption(
+            f"{len(frame)} active setups | setup-quality threshold "
+            f"{setup_quality_threshold:.1f} | sorted by Setup Quality Score"
+        )
     if errors:
         with st.expander(f"Skipped inputs ({len(errors)})", expanded=False):
             for error in errors:
