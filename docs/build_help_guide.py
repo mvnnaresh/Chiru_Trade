@@ -177,7 +177,7 @@ for name in ("List Bullet", "List Number"):
 
 header = section.header
 hp = header.paragraphs[0]
-hp.text = "ELLIOTT WAVE TERMINAL  |  OPERATOR GUIDE"
+hp.text = "ELLIOTT WAVE TERMINAL  |  SIMPLE USER GUIDE"
 hp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
 for run in hp.runs:
     run.font.size = Pt(8)
@@ -185,7 +185,7 @@ for run in hp.runs:
     run.font.color.rgb = RGBColor.from_string(MUTED)
 footer = section.footer
 fp = footer.paragraphs[0]
-fp.text = "Decision support only - validate risk, liquidity, and execution independently."
+fp.text = "This tool gives information only. It does not guarantee profit."
 fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
 for run in fp.runs:
     run.font.size = Pt(8)
@@ -204,13 +204,13 @@ r.font.color.rgb = RGBColor.from_string(NAVY)
 p = doc.add_paragraph()
 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 p.paragraph_format.space_after = Pt(20)
-r = p.add_run("User Guide and Trading Decision-Support Handbook")
+r = p.add_run("Simple User Guide")
 r.font.size = Pt(16)
 r.font.color.rgb = RGBColor.from_string(BLUE)
 p = doc.add_paragraph()
 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 p.paragraph_format.space_after = Pt(28)
-r = p.add_run("Deterministic pivots  |  Auditable wave rules  |  Causal scoring  |  Multi-market scanning")
+r = p.add_run("Choose a market  |  Read the chart  |  Check risk")
 r.italic = True
 r.font.size = Pt(10.5)
 r.font.color.rgb = RGBColor.from_string(MUTED)
@@ -223,20 +223,110 @@ add_picture(
 p = doc.add_paragraph()
 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 p.paragraph_format.space_before = Pt(14)
-r = p.add_run("Prepared for the current 25-market test build")
+r = p.add_run("Written in simple English for new users")
 r.bold = True
 r.font.color.rgb = RGBColor.from_string(GREEN)
-p = doc.add_paragraph("Version 1.0  |  July 2026")
+p = doc.add_paragraph("Version 1.1  |  2 July 2026")
 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 p.runs[0].font.color.rgb = RGBColor.from_string(MUTED)
 
 page_break(doc)
-doc.add_heading("Purpose and safety boundary", level=1)
+doc.add_heading("Start here", level=1)
 doc.add_paragraph(
-    "The terminal converts canonical five-minute OHLCV data into volatility-adjusted pivots, "
-    "tests deterministic Elliott structures, ranks surviving alternatives, and exposes exact "
-    "invalidation and target references. It is designed to help a trader organize evidence. "
-    "It does not predict with certainty and it does not replace position sizing or execution judgment."
+    "This tool studies price charts. It looks for Elliott Wave patterns. "
+    "It shows possible trade ideas. You must make the final decision."
+)
+add_note(
+    doc,
+    "Important",
+    "The tool can be wrong. A high score does not mean sure profit. "
+    "Do not trade money that you cannot afford to lose.",
+    RED,
+)
+doc.add_heading("Open the tool", level=2)
+step(doc, "Open PowerShell", "Go to the Chiru_Trade folder.")
+step(doc, "Start the program", "Type: python -m streamlit run app.py")
+step(doc, "Open the page", "The tool normally opens in your web browser.")
+
+doc.add_heading("Use the tool in 7 easy steps", level=2)
+step(doc, "Choose Market", "Example: NIFTY 50, Bitcoin, Gold, or a company share.")
+step(doc, "Choose Timeframe", "Use 4H or 1D to see the big picture. Use 1H or 30M to see more detail.")
+step(doc, "Keep normal settings", "For a new user, keep Balanced, Actionable, ATR 2.0, and ATR Period 14.")
+step(doc, "Look at Structure Inspector", "Choose one path. Start with path number 1.")
+step(doc, "Read the status", "EntryReady means the pattern may be ready. Forming means wait. Completed means the old pattern has finished.")
+step(doc, "Read the three prices", "Check Entry, Stop or Invalidation, and Target zone.")
+step(doc, "Check risk", "Do not trade only because the tool shows a Buy or Sell idea.")
+
+add_note(
+    doc,
+    "Simple rule",
+    "If you do not understand the pattern, score, stop price, or target, do not trade.",
+    GOLD,
+)
+
+doc.add_heading("Words you will see often", level=2)
+add_table(
+    doc,
+    ["Word", "Simple meaning"],
+    [
+        ("Bullish", "The pattern may move up."),
+        ("Bearish", "The pattern may move down."),
+        ("Forming", "The pattern is not ready. Wait and watch."),
+        ("EntryReady", "The pattern reached a possible entry stage. Check risk before trading."),
+        ("Completed", "The pattern finished. It may be too late for a new trade."),
+        ("Confidence Score", "A quality score from 0 to 100. It is not a profit chance."),
+        ("Invalidation / Stop", "The price that tells you the trade idea is wrong."),
+        ("Target zone", "A possible price area. It is not guaranteed."),
+    ],
+    [2300, 7060],
+)
+
+page_break(doc)
+doc.add_heading("How to read one trade idea", level=1)
+doc.add_paragraph(
+    "Use this order every time. Do not start with the target."
+)
+step(doc, "Direction", "Bullish means up. Bearish means down.")
+step(doc, "Stage", "Prefer EntryReady. Forming is only for watching.")
+step(doc, "Lifecycle", "Use only an Active idea. Do not use an Invalidated idea or an idea where the target was already hit.")
+step(doc, "Score", "A higher score means more rules agree. It does not mean the trade will win.")
+step(doc, "Invalidation", "Know where the idea becomes wrong before you enter.")
+step(doc, "Target", "Check if the possible reward is worth the risk.")
+step(doc, "Your own checks", "Check market news, trading cost, available money, and other open trades.")
+
+doc.add_heading("What the chart marks mean", level=2)
+add_table(
+    doc,
+    ["Mark", "Meaning"],
+    [
+        ("Green up arrow", "Possible bullish setup. Check all details before buying."),
+        ("Red down arrow", "Possible bearish setup. Check all details before selling."),
+        ("Red line", "Invalidation or stop reference."),
+        ("Green lines", "Possible target area."),
+        ("Dashed wave line", "The pattern is still forming."),
+        ("Solid wave line", "The pattern is complete."),
+    ],
+    [2450, 6910],
+)
+add_note(
+    doc,
+    "No arrow",
+    "No arrow is not a software error. The score may be too low, the pattern may not be ready, "
+    "or the selected path may be hidden.",
+    BLUE,
+)
+
+page_break(doc)
+doc.add_heading("Detailed guide", level=1)
+doc.add_paragraph(
+    "The next pages give more detail. New users can read them slowly. "
+    "You do not need to understand every technical word on the first day."
+)
+doc.add_heading("Purpose and safety boundary", level=2)
+doc.add_paragraph(
+    "The tool reads five-minute price data. It builds larger timeframes, finds possible Elliott Wave "
+    "patterns, and ranks them. It also shows an invalidation price and a target area. "
+    "The tool helps you study a chart. It cannot predict the market with certainty."
 )
 add_note(
     doc,
@@ -569,8 +659,9 @@ add_note(
 page_break(doc)
 doc.add_heading("Alerts and operations", level=1)
 doc.add_paragraph(
-    "Open Alerts & operations below the terminal. Set the Telegram Chat ID and Alert Confidence Score. The bot token "
-    "belongs in .streamlit/secrets.toml as TELEGRAM_BOT_TOKEN; it is intentionally not entered in the browser."
+    "Open Alerts & operations below the chart. First select Configure Telegram credentials. "
+    "The Bot Token and Chat ID boxes will then appear. Enter these details only when you need them. "
+    "Keeping the boxes closed also stops Firefox from showing its password menu inside Structure Inspector."
 )
 add_note(
     doc,
@@ -677,6 +768,7 @@ add_table(
         ("Different alternatives overlap", "The DAG found multiple valid paths through nearby pivots.", "Focus one path and compare exact labels, invalidation, stage, and score."),
         ("Scanner row differs from chart", "ATR settings, candidate scope, data refresh, or lifecycle changed.", "Match parameters and rerun the scanner immediately before inspection."),
         ("Dashboard shows old markets", "The Streamlit process or browser session is stale.", "Restart Streamlit and hard-refresh the browser."),
+        ("Manage Passwords appears in Structure Inspector", "Telegram credential boxes are open, so Firefox thinks the inspector is a login box.", "Close or clear Configure Telegram credentials, then refresh the page."),
     ],
     [1800, 3650, 3910],
 )
@@ -724,7 +816,7 @@ add_note(
 
 core = doc.core_properties
 core.title = "Elliott Wave Terminal User Guide"
-core.subject = "Operator manual for the deterministic Elliott Wave decision-support dashboard"
+core.subject = "Simple user guide for the Elliott Wave decision-support dashboard"
 core.author = "Elliott Wave DSS Project"
 core.keywords = "Elliott Wave, decision support, user guide, trading, Streamlit"
 doc.save(OUT)

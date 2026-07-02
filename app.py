@@ -1132,7 +1132,42 @@ def _inject_terminal_css(st) -> None:
 
 def _render_single_chart_fragmented() -> None:
     import streamlit as st
+    import streamlit.components.v1 as components
     from streamlit_lightweight_charts import renderLightweightCharts
+
+    components.html(
+        """
+        <script>
+        (() => {
+            const parentDocument = window.parent.document;
+            const ignorePasswordManagers = (root = parentDocument) => {
+                root.querySelectorAll(
+                    '[data-testid="stSelectbox"] input, input[type="password"]'
+                ).forEach((input) => {
+                    input.setAttribute(
+                        'autocomplete',
+                        input.type === 'password' ? 'new-password' : 'off'
+                    );
+                    input.setAttribute('data-1p-ignore', 'true');
+                    input.setAttribute('data-bwignore', 'true');
+                    input.setAttribute('data-lpignore', 'true');
+                    input.setAttribute('data-protonpass-ignore', 'true');
+                });
+            };
+
+            ignorePasswordManagers();
+            window.parent.__elliottPasswordManagerObserver?.disconnect();
+            window.parent.__elliottPasswordManagerObserver =
+                new window.parent.MutationObserver(() => ignorePasswordManagers());
+            window.parent.__elliottPasswordManagerObserver.observe(
+                parentDocument.body,
+                {childList: true, subtree: true}
+            );
+        })();
+        </script>
+        """,
+        height=0,
+    )
 
     databases = discover_databases()
     query = st.query_params
@@ -1677,8 +1712,29 @@ def _render_single_chart_fragmented() -> None:
                     "Use the selected candidate, threshold gate, and trader-facing panel "
                     "to decide whether to forward a signal externally."
                 )
-                bot_token = st.text_input("Bot Token", type="password", key="telegram_bot_token")
-                chat_id = st.text_input("Chat ID", key="telegram_chat_id")
+                configure_telegram = st.checkbox(
+                    "Configure Telegram credentials",
+                    value=False,
+                    key="configure_telegram_credentials",
+                    help=(
+                        "Credentials are kept out of the page until needed so browsers "
+                        "do not mistake the Structure Inspector for a login field."
+                    ),
+                )
+                bot_token = ""
+                chat_id = ""
+                if configure_telegram:
+                    bot_token = st.text_input(
+                        "Bot Token",
+                        type="password",
+                        key="telegram_bot_token",
+                        autocomplete="new-password",
+                    )
+                    chat_id = st.text_input(
+                        "Chat ID",
+                        key="telegram_chat_id",
+                        autocomplete="off",
+                    )
                 st.slider(
                     "Alert Confidence Score",
                     min_value=0.0,
@@ -1687,7 +1743,11 @@ def _render_single_chart_fragmented() -> None:
                     step=0.5,
                     key="alert_threshold",
                 )
-                if st.button("Emit local alert shell", width="stretch"):
+                if st.button(
+                    "Emit local alert shell",
+                    width="stretch",
+                    disabled=not configure_telegram,
+                ):
                     emit_alert_shell(selected_candidate, selected_score, bot_token, chat_id)
 
     _render_terminal_body()
@@ -2198,7 +2258,7 @@ def _render_single_chart() -> None:
                 "Tokens are never entered into the browser.</div>",
                 unsafe_allow_html=True,
             )
-            chat_id = st.text_input("Telegram Chat ID")
+            chat_id = st.text_input("Telegram Chat ID", autocomplete="off")
             alert_threshold = st.slider("Alert Confidence Score", 0, 100, int(alert_threshold), key="alert_threshold")
             st.caption("Log-only webhook shell. No network request is sent.")
             if scoped_rankings:
