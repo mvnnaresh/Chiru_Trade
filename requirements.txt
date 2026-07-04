@@ -3,3 +3,5 @@ pytest>=8,<9
 streamlit>=1.35,<2
 streamlit-lightweight-charts==0.7.20
 yfinance>=0.2.54,<1
+protobuf>=5,<7
+websocket-client>=1.8,<2

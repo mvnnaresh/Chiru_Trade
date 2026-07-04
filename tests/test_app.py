@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 from dataclasses import replace
@@ -5,7 +6,7 @@ from dataclasses import replace
 import pandas as pd
 import app as app_module
 from db import TIMEFRAMES
-from decision import DecisionState
+from decision import DecisionState, build_decision_state
 from backtester import Friction
 
 from app import (
@@ -35,7 +36,16 @@ from app import (
     resolve_sensitivity,
     resolve_setup_quality_threshold,
     scan_global_markets,
+    candidate_signature,
+    match_scanner_candidate,
     scanner_candidate_row,
+    scanner_candidate_key,
+    scanner_cache_is_compatible,
+    scanner_inspect_button_key,
+    scanner_selector_defaults,
+    scanner_setup_context,
+    save_scanner_results,
+    store_scanner_setup,
     system_status,
     system_hints,
     target_zone,
@@ -816,18 +826,31 @@ def test_global_scanner_sorts_active_setups_and_skips_failed_inputs(
         index=pd.date_range("2026-01-01", periods=5, freq="5min", tz="UTC"),
     )
 
-    def fake_compute(database, timeframe, _multiplier, _period):
+    active_database = {"name": ""}
+
+    def fake_load(database):
         if database.name == "BROKEN.db":
             raise ValueError("invalid database")
-        confidence = 90 if database.name == "NIFTY.db" else 70
+        active_database["name"] = database.name
+        return candles
+
+    def fake_resample(source, timeframe, database):
+        active_database["name"] = database.name
+        return source
+
+    def fake_compute(source, _multiplier, _period):
+        database_name = active_database["name"]
+        confidence = 90 if database_name == "NIFTY.db" else 70
         return DashboardResult(
-            candles,
+            source,
             active.pivots,
             ((active, score(confidence)),),
-            pd.Series(50, index=candles.index),
+            pd.Series(50, index=source.index),
         )
 
-    monkeypatch.setattr(app_module, "compute_dashboard", fake_compute)
+    monkeypatch.setattr(app_module, "load_m5", fake_load)
+    monkeypatch.setattr(app_module, "resample_m5", fake_resample)
+    monkeypatch.setattr(app_module, "compute_dashboard_from_candles", fake_compute)
 
     frame, errors = scan_global_markets(
         (first, second, broken),
@@ -856,7 +879,7 @@ def test_global_scanner_sorts_active_setups_and_skips_failed_inputs(
     assert set(frame["Timeframe"]) == set(TIMEFRAMES)
     assert frame.iloc[0]["Pattern"] == "Impulse"
     assert frame.iloc[0]["Current Wave"] == "EntryReady at Wave 4"
-    assert len(errors) == timeframe_count
+    assert len(errors) == 1
 
 
 def test_scanner_candidate_states_share_terminal_quality_and_risk_gates():
@@ -988,3 +1011,194 @@ def test_scanner_sorts_by_decision_then_quality(tmp_path, monkeypatch):
     order = {"TRADE READY": 0, "BLOCKED": 1, "WATCH": 2, "NO TRADE": 3}
     ranks = [order[value] for value in frame["Trade Decision"]]
     assert ranks == sorted(ranks)
+
+
+def test_scanner_row_has_stable_candidate_navigation_identity():
+    active = candidate()
+    candles = pd.DataFrame(
+        {"open": [110], "high": [111], "low": [109], "close": [110], "volume": [1]},
+        index=[active.pivots[-1].timestamp],
+    )
+    row = scanner_candidate_row(
+        market="NASDAQ_100",
+        database_name="NASDAQ_100.db",
+        timeframe="2H",
+        candidate=active,
+        score=score(80),
+        candles=candles,
+        setup_quality_threshold=70,
+        risk_policy=RiskPolicy(100_000),
+        friction=Friction(),
+    )
+
+    assert row["Candidate Key"] == scanner_candidate_key(
+        "NASDAQ_100.db", "2H", active
+    )
+    assert json.loads(row["Pivot Signature"]) == candidate_signature(active)
+
+
+def test_scanner_inspect_context_applies_market_timeframe_and_pattern():
+    row = {
+        "Market": "NASDAQ_100",
+        "Database Name": "NASDAQ_100.db",
+        "Timeframe": "2H",
+        "Pattern": "ZigZag",
+        "Direction": "SELL",
+        "Setup Stage": "EntryReady",
+        "Current Wave": "EntryReady at Wave B",
+        "Candidate Key": "abc",
+        "Pivot Signature": "{}",
+        "Trade Decision": "TRADE READY",
+        "Setup Quality Score": 82.4,
+    }
+    state = {}
+
+    context = store_scanner_setup(state, row)
+    defaults = scanner_selector_defaults(context)
+
+    assert state["requested_active_tab"] == "single_chart"
+    assert "active_tab" not in state
+    assert state["selected_scanner_setup"] == scanner_setup_context(row)
+    assert defaults == {
+        "database": "NASDAQ_100.db",
+        "timeframe": "2H",
+        "pattern_view": "ZigZag | ABC",
+        "candidate_scope": "All history",
+    }
+
+
+def test_scanner_results_persist_and_inspect_keys_are_unique():
+    frame = pd.DataFrame(
+        [
+            {
+                "Trade Decision": "TRADE READY",
+                "Market": "NASDAQ_100",
+                "Timeframe": "2H",
+                "Candidate Key": "same-key",
+            },
+            {
+                "Trade Decision": "WATCH",
+                "Market": "NASDAQ_100",
+                "Timeframe": "2H",
+                "Candidate Key": "same-key",
+            },
+        ]
+    )
+    state = {"active_tab": "scanner"}
+    timestamp = pd.Timestamp("2026-07-04 12:00", tz="Asia/Kolkata")
+
+    save_scanner_results(state, frame, (), {"evaluate_risk": False}, timestamp)
+    state["active_tab"] = "single_chart"
+    state["active_tab"] = "scanner"
+
+    assert state["last_scanner_results"].equals(frame)
+    assert state["last_scanner_summary"] == {"TRADE READY": 1, "WATCH": 1}
+    assert state["last_scan_timestamp"] == timestamp.isoformat()
+    keys = [
+        scanner_inspect_button_key(row, index)
+        for index, (_, row) in enumerate(frame.iterrows())
+    ]
+    assert len(keys) == len(set(keys))
+
+
+def test_risk_setting_change_invalidates_cached_scanner_decisions():
+    previous = {
+        "evaluate_risk": True,
+        "risk_policy": "RiskPolicy(minimum_reward_risk=1.5)",
+    }
+    assert scanner_cache_is_compatible(previous, dict(previous))
+    changed = {**previous, "risk_policy": "RiskPolicy(minimum_reward_risk=2.0)"}
+    assert not scanner_cache_is_compatible(previous, changed)
+
+
+def test_scanner_loads_sqlite_once_per_market_for_many_timeframes(
+    tmp_path, monkeypatch
+):
+    databases = (tmp_path / "ONE.db", tmp_path / "TWO.db")
+    for database in databases:
+        database.touch()
+    active = candidate()
+    candles = pd.DataFrame(
+        {"open": [110], "high": [111], "low": [109], "close": [110], "volume": [1]},
+        index=[active.pivots[-1].timestamp],
+    )
+    calls = []
+
+    def fake_load(database):
+        calls.append(database.name)
+        return candles
+
+    monkeypatch.setattr(app_module, "load_m5", fake_load)
+    monkeypatch.setattr(app_module, "resample_m5", lambda source, *_args: source)
+    monkeypatch.setattr(
+        app_module,
+        "compute_dashboard_from_candles",
+        lambda source, *_args: DashboardResult(
+            source,
+            active.pivots,
+            ((active, score(80)),),
+            pd.Series(50, index=source.index),
+        ),
+    )
+
+    frame, errors = scan_global_markets(
+        databases,
+        2.0,
+        14,
+        evaluate_risk=False,
+        timeframes=("15M", "1H", "4H", "1D"),
+        candidate_limit=1,
+    )
+
+    assert calls == ["ONE.db", "TWO.db"]
+    assert len(frame) == 8
+    assert errors == ()
+
+
+def test_scanner_candidate_exact_and_missing_key_matching():
+    first = candidate()
+    second = replace(
+        first,
+        pivots=first.pivots[:-1] + (replace(first.pivots[-1], price=113.0),),
+    )
+    rankings = ((first, score(80)), (second, score(79)))
+    signature = candidate_signature(second)
+    context = {
+        "candidate_key": _candidate_query_key(second),
+        "pivot_signature": json.dumps(signature),
+        "pattern": second.pattern,
+        "direction": "BUY",
+        "setup_stage": second.status,
+        "current_wave": current_wave_label(second),
+    }
+
+    assert match_scanner_candidate(rankings, context) == (1, True)
+    missing = {**context, "candidate_key": "missing"}
+    index, exact = match_scanner_candidate(rankings, missing)
+    assert index == 1
+    assert exact is False
+
+
+def test_scanner_and_single_chart_decisions_match_same_context():
+    active = candidate()
+    candles = pd.DataFrame(
+        {"open": [110], "high": [111], "low": [109], "close": [110], "volume": [1]},
+        index=[active.pivots[-1].timestamp],
+    )
+    policy = RiskPolicy(100_000)
+    row = scanner_candidate_row(
+        market="TEST",
+        database_name="TEST.db",
+        timeframe="1H",
+        candidate=active,
+        score=score(80),
+        candles=candles,
+        setup_quality_threshold=70,
+        risk_policy=policy,
+        friction=Friction(),
+    )
+    decision = build_decision_state(
+        active, score(80), 70, "Active", candles, policy, Friction()
+    )
+
+    assert row["Trade Decision"] == decision.status

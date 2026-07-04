@@ -7,17 +7,22 @@ Run with:
 from __future__ import annotations
 
 import html
+import hashlib
+import json
 import logging
+import os
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 
 from backtester import Friction, build_causal_rankings, run_backtest
 from decision import DecisionState, build_decision_state
-from db import TIMEFRAMES, resample_ohlcv
+from db import TIMEFRAMES, load_m5, resample_m5, resample_ohlcv
 from engine import (
     WaveCandidate,
     build_candidates,
@@ -25,6 +30,7 @@ from engine import (
     select_active_primary,
 )
 from market_data import append_latest_m5, resolve_market_symbol
+from live.instrument_resolver import DEFAULT_UPSTOX_UNIVERSE, resolve_instruments
 from pivots import Pivot, PivotState, extract_pivot_state
 from scoring import ConfidenceScore, calculate_rsi, score_candidates
 from risk import RiskPolicy
@@ -52,6 +58,46 @@ class DashboardResult:
     rankings: tuple[tuple[WaveCandidate, ConfidenceScore], ...]
     rsi: pd.Series
     pivot_state: PivotState | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ScannerRow:
+    candidate_key: str
+    pivot_signature: str
+    database_name: str
+    market: str
+    timeframe: str
+    pattern: str
+    direction: str
+    trade_decision: str
+    structure_status: str
+    setup_stage: str
+    current_wave: str
+    reason: str
+    setup_quality_score: float
+    risk_reward: float | str
+    invalidation: float | None
+    target_zone: str | None
+
+    def as_record(self) -> dict[str, object]:
+        return {
+            "Trade Decision": self.trade_decision,
+            "Structure Status": self.structure_status,
+            "Direction": self.direction,
+            "Reason": self.reason,
+            "Setup Quality Score": self.setup_quality_score,
+            "Risk/Reward": self.risk_reward,
+            "Market": self.market,
+            "Timeframe": self.timeframe,
+            "Pattern": self.pattern,
+            "Current Wave": self.current_wave,
+            "Invalidation": self.invalidation,
+            "Target Zone": self.target_zone,
+            "Database Name": self.database_name,
+            "Setup Stage": self.setup_stage,
+            "Candidate Key": self.candidate_key,
+            "Pivot Signature": self.pivot_signature,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +234,15 @@ def compute_dashboard(
 ) -> DashboardResult:
     """Load, extract, validate, and rank the current chart state."""
     candles = resample_ohlcv(database, timeframe.upper())  # type: ignore[arg-type]
+    return compute_dashboard_from_candles(candles, atr_multiplier, atr_period)
+
+
+def compute_dashboard_from_candles(
+    candles: pd.DataFrame,
+    atr_multiplier: float,
+    atr_period: int = 14,
+) -> DashboardResult:
+    """Extract and rank structures from an already-loaded/resampled frame."""
     empty_rsi = pd.Series(index=candles.index, dtype=float, name="rsi")
     if candles.empty or len(candles) < atr_period:
         return DashboardResult(candles, (), (), empty_rsi)
@@ -914,12 +969,177 @@ def _candidate_name(index: int, candidate: WaveCandidate, score: ConfidenceScore
 
 def _candidate_query_key(candidate: WaveCandidate) -> str:
     """Return a stable query-string key for the currently selected candidate."""
-    labels = ",".join(candidate.labels)
-    pivots = ",".join(
-        pivot.timestamp.tz_convert("UTC").strftime("%Y%m%d%H%M%S")
-        for pivot in candidate.pivots
+    encoded = json.dumps(
+        candidate_signature(candidate), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def scanner_candidate_key(
+    database_name: str, timeframe: str, candidate: WaveCandidate
+) -> str:
+    """Return a stable scanner identity that cannot collide across markets/frames."""
+    payload = {
+        "database_name": database_name,
+        "timeframe": timeframe.upper(),
+        **candidate_signature(candidate),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def candidate_signature(candidate: WaveCandidate) -> dict[str, object]:
+    """Return stable, refresh-safe structural identity for a candidate."""
+    setup_time, setup_price = _setup_endpoint(candidate)
+    return {
+        "pattern": candidate.pattern,
+        "direction": candidate.direction,
+        "status": candidate.status,
+        "labels": list(candidate.labels),
+        "pivots": [
+            [
+                pivot.timestamp.isoformat(),
+                round(float(pivot.price), 8),
+                pivot.type,
+            ]
+            for pivot in candidate.pivots
+        ],
+        "setup_pivot_timestamp": setup_time.isoformat(),
+        "setup_pivot_price": round(float(setup_price), 8),
+    }
+
+
+def scanner_setup_context(row: pd.Series | dict[str, object]) -> dict[str, object]:
+    """Convert one scanner row into the exact Single Chart navigation context."""
+    return {
+        "market": row["Market"],
+        "database": row["Database Name"],
+        "timeframe": row["Timeframe"],
+        "pattern": row["Pattern"],
+        "direction": row["Direction"],
+        "setup_stage": row["Setup Stage"],
+        "current_wave": row["Current Wave"],
+        "candidate_key": row["Candidate Key"],
+        "pivot_signature": row["Pivot Signature"],
+        "trade_decision": row["Trade Decision"],
+        "structure_status": row.get("Structure Status", ""),
+        "setup_quality_score": float(row["Setup Quality Score"]),
+        "risk_reward": row.get("Risk/Reward"),
+    }
+
+
+def store_scanner_setup(
+    state: dict[str, object], row: pd.Series | dict[str, object]
+) -> dict[str, object]:
+    """Store scanner navigation state without coupling it to Streamlit."""
+    context = scanner_setup_context(row)
+    state["selected_scanner_setup"] = context
+    # Streamlit forbids mutating a widget's key after that widget is
+    # instantiated in the current run. Apply this request before the tab
+    # selector is created on the next rerun.
+    state["requested_active_tab"] = "single_chart"
+    return context
+
+
+def scanner_inspect_button_key(
+    row: pd.Series | dict[str, object], row_index: int
+) -> str:
+    """Build a unique Inspect widget key from stable setup identity."""
+    return (
+        f"inspect_{row['Candidate Key']}_{row['Market']}_"
+        f"{row['Timeframe']}_{row_index}"
     )
-    return f"{candidate.pattern}|{candidate.direction}|{candidate.status}|{labels}|{pivots}"
+
+
+def save_scanner_results(
+    state: dict[str, object],
+    frame: pd.DataFrame,
+    errors: tuple[str, ...],
+    settings: dict[str, object],
+    timestamp: pd.Timestamp,
+) -> None:
+    """Persist one complete scan so tab changes cannot discard it."""
+    state["last_scanner_results"] = frame
+    state["last_scanner_summary"] = (
+        frame["Trade Decision"].value_counts().to_dict() if not frame.empty else {}
+    )
+    state["last_scanner_settings"] = settings
+    state["last_scan_timestamp"] = timestamp.isoformat()
+    state["scanner_errors"] = errors
+    state["scanner_frame"] = frame
+
+
+def scanner_cache_is_compatible(
+    previous: dict[str, object] | None, current: dict[str, object]
+) -> bool:
+    """Return whether cached decisions were made with the current settings."""
+    return previous is not None and previous == current
+
+
+def scanner_selector_defaults(context: dict[str, object]) -> dict[str, str]:
+    """Translate scanner context into Single Chart widget values."""
+    pattern = str(context.get("pattern", ""))
+    return {
+        "database": str(context.get("database", "")),
+        "timeframe": str(context.get("timeframe", "1H")),
+        "pattern_view": (
+            "Impulse | 1-5"
+            if pattern == "Impulse"
+            else "ZigZag | ABC"
+            if pattern == "ZigZag"
+            else "Balanced | 1-5 + ABC"
+        ),
+        "candidate_scope": "All history",
+    }
+
+
+def match_scanner_candidate(
+    rankings: tuple[tuple[WaveCandidate, ConfidenceScore], ...],
+    context: dict[str, object],
+) -> tuple[int, bool]:
+    """Find the exact scanner candidate or the nearest explicitly ranked match."""
+    if not rankings:
+        return 0, False
+    key = str(context.get("candidate_key", ""))
+    database_name = str(context.get("database", ""))
+    timeframe = str(context.get("timeframe", ""))
+    for index, (candidate, _score) in enumerate(rankings):
+        if key in {
+            scanner_candidate_key(database_name, timeframe, candidate),
+            _candidate_query_key(candidate),
+        }:
+            return index, True
+    try:
+        signature = json.loads(str(context.get("pivot_signature", "{}")))
+    except ValueError:
+        signature = {}
+    expected_time = pd.Timestamp(signature.get("setup_pivot_timestamp"))
+    expected_price = float(signature.get("setup_pivot_price", 0.0))
+    expected_direction = str(context.get("direction", "")).title()
+    if expected_direction == "Buy":
+        expected_direction = "Bullish"
+    elif expected_direction == "Sell":
+        expected_direction = "Bearish"
+
+    def proximity(item: tuple[WaveCandidate, ConfidenceScore]) -> tuple[object, ...]:
+        candidate = item[0]
+        setup_time, setup_price = _setup_endpoint(candidate)
+        time_distance = (
+            abs((setup_time - expected_time).total_seconds())
+            if not pd.isna(expected_time)
+            else float("inf")
+        )
+        return (
+            candidate.pattern != context.get("pattern"),
+            candidate.direction != expected_direction,
+            candidate.status != context.get("setup_stage"),
+            current_wave_label(candidate) != context.get("current_wave"),
+            time_distance,
+            abs(float(setup_price) - expected_price),
+        )
+
+    nearest = min(range(len(rankings)), key=lambda index: proximity(rankings[index]))
+    return nearest, False
 
 
 def _resolve_selected_index(
@@ -1348,6 +1568,24 @@ def _render_single_chart_fragmented() -> None:
 
     databases = discover_databases()
     query = st.query_params
+    scanner_context = st.session_state.get("selected_scanner_setup")
+    if isinstance(scanner_context, dict):
+        scanner_defaults = scanner_selector_defaults(scanner_context)
+        scanner_key = str(scanner_context.get("candidate_key", ""))
+        if st.session_state.get("applied_scanner_candidate_key") != scanner_key:
+            database_name = scanner_defaults["database"]
+            matched_database = next(
+                (path for path in databases if path.name == database_name), None
+            )
+            if matched_database is not None:
+                st.session_state["selected_market"] = matched_database
+            st.session_state["selected_timeframe"] = scanner_defaults["timeframe"]
+            st.session_state["selected_pattern_view"] = scanner_defaults["pattern_view"]
+            st.session_state["selected_candidate_scope"] = scanner_defaults[
+                "candidate_scope"
+            ]
+            st.session_state.pop("selected_candidate_label", None)
+            st.session_state["applied_scanner_candidate_key"] = scanner_key
     market_names = [path.name for path in databases]
     timeframe_options = tuple(TIMEFRAMES)
     pattern_options = (
@@ -1358,12 +1596,41 @@ def _render_single_chart_fragmented() -> None:
     scope_options = ("Actionable", "Recent | 30D", "All history")
     sensitivity_options = tuple(SENSITIVITY_PRESETS)
 
-    market_default = query.get("market", market_names[0] if market_names else None)
-    timeframe_default = query.get("timeframe", "1H")
-    pattern_default = query.get("pattern_view", pattern_options[0])
-    scope_default = query.get("candidate_scope", scope_options[0])
+    market_default = (
+        scanner_context.get("database")
+        if isinstance(scanner_context, dict)
+        else query.get("market", market_names[0] if market_names else None)
+    )
+    timeframe_default = (
+        scanner_context.get("timeframe")
+        if isinstance(scanner_context, dict)
+        else query.get("timeframe", "1H")
+    )
+    context_pattern = (
+        str(scanner_context.get("pattern", ""))
+        if isinstance(scanner_context, dict)
+        else ""
+    )
+    pattern_default = (
+        "Impulse | 1-5"
+        if context_pattern == "Impulse"
+        else "ZigZag | ABC"
+        if context_pattern == "ZigZag"
+        else "Balanced | 1-5 + ABC"
+        if context_pattern
+        else query.get("pattern_view", pattern_options[0])
+    )
+    scope_default = (
+        "All history"
+        if isinstance(scanner_context, dict)
+        else query.get("candidate_scope", scope_options[0])
+    )
     sensitivity_default = query.get("sensitivity", "Balanced")
     live_default = query.get("live_yahoo", "0") == "1"
+    provider_default = query.get(
+        "data_provider",
+        "Yahoo Test Refresh" if live_default else "Local SQLite",
+    )
     live_interval_default = query.get("live_interval", "30s")
 
     title_col, status_col = st.columns([0.75, 0.25], vertical_alignment="center")
@@ -1419,12 +1686,18 @@ def _render_single_chart_fragmented() -> None:
 
     live_supported = selected_database is not None and resolve_market_symbol(selected_database) is not None
     with live_col:
-        live_mode = st.toggle(
-            "Yahoo Live",
-            value=live_default,
-            key="live_yahoo_enabled",
-            disabled=not live_supported,
+        provider_options = ("Local SQLite", "Yahoo Test Refresh", "Upstox Live")
+        data_provider = st.selectbox(
+            "Data Provider",
+            provider_options,
+            index=(
+                provider_options.index(provider_default)
+                if provider_default in provider_options
+                else 0
+            ),
+            key="data_provider",
         )
+        live_mode = data_provider == "Yahoo Test Refresh"
     with universe_col:
         candidate_scope = st.selectbox(
             "Candidate Scope",
@@ -1432,6 +1705,17 @@ def _render_single_chart_fragmented() -> None:
             index=scope_options.index(scope_default) if scope_default in scope_options else 0,
             key="selected_candidate_scope",
         )
+    if isinstance(scanner_context, dict):
+        expected = scanner_selector_defaults(scanner_context)
+        if (
+            selected_database is None
+            or selected_database.name != expected["database"]
+            or timeframe != expected["timeframe"]
+            or pattern_view != expected["pattern_view"]
+        ):
+            st.session_state.pop("selected_scanner_setup", None)
+            st.session_state.pop("applied_scanner_candidate_key", None)
+            scanner_context = None
 
     with st.expander("Advanced Settings", expanded=False):
         advanced_override = st.checkbox(
@@ -1509,6 +1793,47 @@ def _render_single_chart_fragmented() -> None:
         st.caption(
             f"Resolved setup-quality threshold: {resolved_setup_quality_threshold:.1f}"
         )
+        upstox_token = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
+        if data_provider == "Upstox Live":
+            if not upstox_token:
+                try:
+                    upstox_token = str(st.secrets.get("UPSTOX_ACCESS_TOKEN", "")).strip()
+                except Exception:
+                    upstox_token = ""
+            if not upstox_token:
+                upstox_token = st.text_input(
+                    "Upstox Access Token",
+                    type="password",
+                    key="upstox_access_token",
+                    help="Held only in this Streamlit session; credentials are never written.",
+                ).strip()
+            resolved_upstox, unresolved_upstox = resolve_instruments()
+            st.caption(
+                f"Selected universe: {len(DEFAULT_UPSTOX_UNIVERSE)} | "
+                f"Resolved: {len(resolved_upstox)}"
+            )
+            if unresolved_upstox:
+                st.warning(
+                    "Unresolved instruments: "
+                    + ", ".join(item.database_name for item in unresolved_upstox)
+                )
+            status_file = Path("upstox_live_status.json")
+            status_payload: dict[str, object] = {}
+            if status_file.exists():
+                try:
+                    status_payload = json.loads(status_file.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    status_payload = {"state": "UPSTOX CONNECTION ERROR"}
+            st.caption(
+                f"Connection: {status_payload.get('state', 'not started')} | "
+                f"Last tick: {status_payload.get('last_tick_time') or 'n/a'} | "
+                f"Last completed M5: "
+                f"{status_payload.get('last_completed_m5') or 'n/a'}"
+            )
+            st.caption(
+                "Run `python live/upstox_live_ingestor.py --universe default` "
+                "in a separate terminal. OAuth refresh/login remains TODO."
+            )
 
     risk_policy: RiskPolicy | None = None
     friction: Friction | None = None
@@ -1556,6 +1881,7 @@ def _render_single_chart_fragmented() -> None:
     query["candidate_scope"] = candidate_scope
     query["sensitivity"] = sensitivity
     query["live_yahoo"] = "1" if live_mode else "0"
+    query["data_provider"] = data_provider
     query["live_interval"] = st.session_state.get("live_refresh_interval", live_interval_default)
 
     if not databases or selected_database is None:
@@ -1596,10 +1922,38 @@ def _render_single_chart_fragmented() -> None:
             live_supported=live_supported,
             live_refresh_ok=live_refresh_ok,
         )
+        if data_provider == "Yahoo Test Refresh" and effective_live_mode:
+            status_label = (
+                "YAHOO TEST REFRESH"
+                if live_refresh_ok is not False
+                else "LIVE REFRESH ERROR"
+            )
+        elif data_provider == "Upstox Live":
+            if not upstox_token:
+                status_label, status_color = "UPSTOX TOKEN MISSING", "#F05D68"
+            elif unresolved_upstox:
+                status_label, status_color = (
+                    "UPSTOX INSTRUMENTS UNRESOLVED",
+                    "#F0B90B",
+                )
+            else:
+                upstox_state = str(
+                    status_payload.get("state", "UPSTOX CONNECTION ERROR")
+                )
+                status_label = (
+                    "UPSTOX LIVE CONNECTED"
+                    if upstox_state == "UPSTOX LIVE CONNECTED"
+                    else "UPSTOX CONNECTION ERROR"
+                )
+                status_color = (
+                    "#18C98B"
+                    if status_label == "UPSTOX LIVE CONNECTED"
+                    else "#F05D68"
+                )
         pulse_id = int(st.session_state.get("live_poll_count", 0))
         status_prefix = (
             f"<span class='status-live-dot' id='live-dot-{pulse_id}'></span>"
-            if status_label == "SYSTEM LIVE"
+            if status_label in {"SYSTEM LIVE", "UPSTOX LIVE CONNECTED"}
             else "<span class='status-live-dot offline'></span>"
         )
         status_placeholder.markdown(
@@ -1669,6 +2023,20 @@ def _render_single_chart_fragmented() -> None:
                     "Showing the nearest recent impulse from broader history "
                     "for Wave 3 inspection."
                 )
+        scanner_match_exact: bool | None = None
+        if isinstance(scanner_context, dict) and display_rankings:
+            scanner_index, scanner_match_exact = match_scanner_candidate(
+                display_rankings, scanner_context
+            )
+            if scanner_index:
+                display_rankings = (
+                    display_rankings[scanner_index],
+                    *display_rankings[:scanner_index],
+                    *display_rankings[scanner_index + 1 :],
+                )
+        elif isinstance(scanner_context, dict):
+            scanner_match_exact = False
+
         view_result = DashboardResult(
             result.candles,
             result.pivots,
@@ -1729,9 +2097,10 @@ def _render_single_chart_fragmented() -> None:
                     for index, (candidate, score) in enumerate(top_rankings)
                 ]
                 selected_query_key = query.get("selected_candidate")
-                default_selected_index = _resolve_selected_index(
-                    top_rankings,
-                    selected_query_key,
+                default_selected_index = (
+                    0
+                    if isinstance(scanner_context, dict)
+                    else _resolve_selected_index(top_rankings, selected_query_key)
                 )
                 selected_label = st.selectbox(
                     "Inspect path",
@@ -1866,6 +2235,34 @@ def _render_single_chart_fragmented() -> None:
 
         overlays = tuple(overlays_list[:3])
         with chart_col:
+            if isinstance(scanner_context, dict):
+                context_text = (
+                    f"{scanner_context.get('market', 'n/a')} | "
+                    f"{scanner_context.get('timeframe', 'n/a')} | "
+                    f"{scanner_context.get('pattern', 'n/a')} | "
+                    f"{scanner_context.get('trade_decision', 'n/a')} | "
+                    f"{scanner_context.get('structure_status', 'n/a')} | "
+                    f"{scanner_context.get('current_wave', 'n/a')}"
+                )
+                st.info(f"Opened from scanner: {context_text}")
+                if scanner_match_exact:
+                    st.success("Exact scanner setup matched.")
+                else:
+                    notice_key = (
+                        f"scanner-match-warning:"
+                        f"{scanner_context.get('candidate_key', '')}"
+                    )
+                    if st.session_state.get("last_navigation_notice") != notice_key:
+                        st.toast(
+                            "Scanner setup changed or is unavailable after refresh. "
+                            "Showing the nearest candidate.",
+                            icon="⚠️",
+                        )
+                        st.session_state["last_navigation_notice"] = notice_key
+                    st.warning(
+                        "Scanner setup could not be matched after data refresh. "
+                        "Showing the nearest candidate. Re-run scanner if needed."
+                    )
             legend_candidate = selected_candidate if top_rankings else None
             st.markdown(_legend_markup(top_rankings, overlays, legend_candidate), unsafe_allow_html=True)
             selected_lifecycle = (
@@ -2569,6 +2966,7 @@ def _has_completed_trade_setup(candidate: WaveCandidate) -> bool:
 def scanner_candidate_row(
     *,
     market: str,
+    database_name: str | None = None,
     timeframe: str,
     candidate: WaveCandidate,
     score: ConfidenceScore,
@@ -2640,20 +3038,28 @@ def scanner_candidate_row(
                 trade_decision = decision.status
                 reason = decision.reason
 
-    return {
-        "Trade Decision": trade_decision,
-        "Structure Status": structure_status,
-        "Direction": direction,
-        "Reason": reason,
-        "Setup Quality Score": float(score.total),
-        "Risk/Reward": risk_reward,
-        "Market": market,
-        "Timeframe": timeframe,
-        "Pattern": candidate.pattern,
-        "Current Wave": current_wave_label(candidate),
-        "Invalidation": float(candidate.invalidation_level),
-        "Target Zone": f"{target_low:,.5f} - {target_high:,.5f}",
-    }
+    resolved_database = database_name or f"{market}.db"
+    signature = candidate_signature(candidate)
+    return ScannerRow(
+        candidate_key=scanner_candidate_key(resolved_database, timeframe, candidate),
+        pivot_signature=json.dumps(
+            signature, sort_keys=True, separators=(",", ":")
+        ),
+        database_name=resolved_database,
+        market=market,
+        timeframe=timeframe,
+        pattern=candidate.pattern,
+        direction=direction,
+        trade_decision=trade_decision,
+        structure_status=structure_status,
+        setup_stage=candidate.status,
+        current_wave=current_wave_label(candidate),
+        reason=reason,
+        setup_quality_score=float(score.total),
+        risk_reward=risk_reward,
+        invalidation=float(candidate.invalidation_level),
+        target_zone=f"{target_low:,.5f} - {target_high:,.5f}",
+    ).as_record()
 
 
 def scan_global_markets(
@@ -2666,10 +3072,19 @@ def scan_global_markets(
     current_open_risk: float = 0.0,
     realized_daily_loss: float = 0.0,
     evaluate_risk: bool = True,
+    timeframes: tuple[str, ...] | None = None,
+    candidate_limit: int = 3,
+    progress_callback: Callable[[int, int, str, str, int], None] | None = None,
+    dataset_loader: Callable[[Path], pd.DataFrame] | None = None,
+    timeframe_resampler: Callable[[pd.DataFrame, str, Path], pd.DataFrame] | None = None,
 ) -> tuple[pd.DataFrame, tuple[str, ...]]:
-    """Scan every asset/timeframe without mutating terminal state."""
+    """Load each market once, then scan selected timeframes from local M5 data."""
     rows: list[dict[str, object]] = []
     errors: list[str] = []
+    selected_timeframes = tuple(timeframes or TIMEFRAMES)
+    cached_datasets_reused = 0
+    load_dataset = dataset_loader or load_m5
+    resample_dataset = timeframe_resampler or resample_m5
     handled_errors = (
         ValueError,
         OSError,
@@ -2677,17 +3092,36 @@ def scan_global_markets(
         pd.errors.DatabaseError,
         ZeroDivisionError,
     )
-    for database in databases:
-        for timeframe in TIMEFRAMES:
+    for market_index, database in enumerate(databases, start=1):
+        try:
+            m5 = load_dataset(database)
+        except handled_errors as error:
+            errors.append(f"{database.name}: {error}")
+            continue
+        for timeframe_index, timeframe in enumerate(selected_timeframes):
+            if progress_callback is not None:
+                progress_callback(
+                    market_index,
+                    len(databases),
+                    database.stem,
+                    timeframe,
+                    cached_datasets_reused,
+                )
             try:
-                result = compute_dashboard(database, timeframe, atr_multiplier, atr_period)
+                candles = resample_dataset(m5, timeframe, database)
+                result = compute_dashboard_from_candles(
+                    candles, atr_multiplier, atr_period
+                )
+                if timeframe_index:
+                    cached_datasets_reused += 1
             except handled_errors as error:
                 errors.append(f"{database.name} {timeframe}: {error}")
                 continue
-            for candidate, score in result.rankings:
+            for candidate, score in result.rankings[: max(1, candidate_limit)]:
                 rows.append(
                     scanner_candidate_row(
                         market=database.stem,
+                        database_name=database.name,
                         timeframe=timeframe,
                         candidate=candidate,
                         score=score,
@@ -2713,6 +3147,10 @@ def scan_global_markets(
         "Current Wave",
         "Invalidation",
         "Target Zone",
+        "Database Name",
+        "Setup Stage",
+        "Candidate Key",
+        "Pivot Signature",
     )
     frame = pd.DataFrame(rows, columns=columns)
     if not frame.empty:
@@ -2732,7 +3170,7 @@ def scan_global_markets(
     return frame, tuple(errors)
 
 
-def _render_global_scanner() -> None:
+def _render_global_scanner_legacy() -> None:
     import streamlit as st
 
     st.markdown("## Global Market Scanner")
@@ -2821,13 +3259,274 @@ def _render_global_scanner() -> None:
             width="stretch",
             height=min(680, 44 + 35 * len(frame)),
             column_config={
+                "Inspect": st.column_config.LinkColumn(
+                    "Inspect",
+                    display_text="▶",
+                    help="Open this setup in Single Chart Terminal",
+                    width="small",
+                ),
                 "Setup Quality Score": st.column_config.NumberColumn(format="%.2f"),
                 "Invalidation": st.column_config.NumberColumn(format="%.5f"),
+                "Database Name": None,
+                "Setup Stage": None,
+                "Candidate Key": None,
+                "Pivot Signature": None,
             },
         )
         st.caption(
             f"{len(frame)} active setups | setup-quality threshold "
             f"{setup_quality_threshold:.1f} | sorted by Setup Quality Score"
+        )
+    if errors:
+        with st.expander(f"Skipped inputs ({len(errors)})", expanded=False):
+            for error in errors:
+                st.caption(error)
+
+
+def _render_global_scanner() -> None:
+    import streamlit as st
+
+    st.markdown("## Global Market Scanner")
+    st.caption("Persistent opportunity list built from local SQLite data.")
+    sensitivity = st.session_state.get("sensitivity_preset", "Balanced")
+    atr_multiplier, atr_period = resolve_sensitivity(
+        sensitivity,
+        override_enabled=bool(st.session_state.get("advanced_atr_override", False)),
+        atr_multiplier=float(st.session_state.get("atr_multiplier", 2.0)),
+        atr_period=int(st.session_state.get("atr_period", 14)),
+    )
+    databases = discover_databases()
+    quality_threshold = float(
+        st.session_state.get("resolved_setup_quality_threshold", 70.0)
+    )
+    risk_policy = st.session_state.get(
+        "active_risk_policy", RiskPolicy(account_equity=100_000)
+    )
+    friction = st.session_state.get("active_friction", Friction())
+    current_open_risk = float(st.session_state.get("active_current_open_risk", 0.0))
+    realized_daily_loss = float(
+        st.session_state.get("active_realized_daily_loss", 0.0)
+    )
+
+    control_cols = st.columns([1.2, 1.8, 0.8, 1.0])
+    with control_cols[0]:
+        market_scope = st.selectbox(
+            "Markets to scan", ("All", "Indian only", "Selected watchlist")
+        )
+    with control_cols[1]:
+        selected_timeframes = tuple(
+            st.multiselect(
+                "Timeframes to scan",
+                tuple(TIMEFRAMES),
+                default=("15M", "1H", "4H", "1D"),
+            )
+        )
+    with control_cols[2]:
+        candidate_limit = int(st.number_input("Candidate limit", 1, 10, 3, 1))
+    with control_cols[3]:
+        evaluate_risk = st.checkbox(
+            "Evaluate risk in scanner",
+            value=False,
+            help="Optional. Uses Risk Settings and takes more time.",
+        )
+
+    indian_names = {
+        "BHARTI_AIRTEL", "HDFC_BANK", "ICICI_BANK", "INFOSYS",
+        "LARSEN_TOUBRO", "NIFTY_50", "NIFTY_BANK", "RELIANCE", "SBI", "TCS",
+    }
+    if market_scope == "Indian only":
+        scan_databases = tuple(db for db in databases if db.stem in indian_names)
+    elif market_scope == "Selected watchlist":
+        names = [db.stem for db in databases]
+        watchlist = st.multiselect(
+            "Selected watchlist", names, default=names[: min(5, len(names))]
+        )
+        scan_databases = tuple(db for db in databases if db.stem in watchlist)
+    else:
+        scan_databases = databases
+
+    universe_signature = tuple(
+        (db.name, db.stat().st_size, db.stat().st_mtime_ns) for db in scan_databases
+    )
+    scan_settings = {
+        "market_scope": market_scope,
+        "databases": tuple(db.name for db in scan_databases),
+        "universe_signature": universe_signature,
+        "timeframes": selected_timeframes,
+        "candidate_limit": candidate_limit,
+        "evaluate_risk": evaluate_risk,
+        "atr_multiplier": atr_multiplier,
+        "atr_period": atr_period,
+        "setup_quality_threshold": quality_threshold,
+        "risk_policy": repr(risk_policy),
+        "friction": repr(friction),
+        "current_open_risk": current_open_risk,
+        "realized_daily_loss": realized_daily_loss,
+    }
+    previous_settings = st.session_state.get("last_scanner_settings")
+    if (
+        previous_settings is not None
+        and not scanner_cache_is_compatible(previous_settings, scan_settings)
+        and "last_scanner_results" in st.session_state
+    ):
+        for key in ("last_scanner_results", "last_scanner_summary", "last_scan_timestamp"):
+            st.session_state.pop(key, None)
+        st.info("Scanner settings changed. Run the scan to calculate new results.")
+
+    @st.cache_data(show_spinner=False)
+    def cached_market_m5(path: str, size: int, modified: int) -> pd.DataFrame:
+        del size, modified
+        return load_m5(path)
+
+    @st.cache_data(show_spinner=False)
+    def cached_market_timeframe(
+        path: str, size: int, modified: int, timeframe: str
+    ) -> pd.DataFrame:
+        return resample_m5(
+            cached_market_m5(path, size, modified), timeframe, path
+        )
+
+    def dataset_loader(database: Path) -> pd.DataFrame:
+        stat = database.stat()
+        return cached_market_m5(str(database), stat.st_size, stat.st_mtime_ns)
+
+    def timeframe_resampler(
+        _m5: pd.DataFrame, timeframe: str, database: Path
+    ) -> pd.DataFrame:
+        stat = database.stat()
+        return cached_market_timeframe(
+            str(database), stat.st_size, stat.st_mtime_ns, timeframe
+        )
+
+    status_col, run_col, clear_col = st.columns(
+        [0.66, 0.22, 0.12], vertical_alignment="center"
+    )
+    with status_col:
+        st.markdown(
+            f"<div class='terminal-panel'><span class='terminal-kicker'>Scan universe</span>"
+            f"<div class='terminal-value'>{len(scan_databases)} markets | "
+            f"{len(selected_timeframes)} timeframes | ATR {atr_period} x "
+            f"{atr_multiplier:.1f}</div></div>",
+            unsafe_allow_html=True,
+        )
+    with run_col:
+        run_scan = st.button(
+            "Run market scan",
+            type="primary",
+            width="stretch",
+            disabled=not scan_databases or not selected_timeframes,
+        )
+    with clear_col:
+        clear_scan = st.button(
+            "Clear scan",
+            width="stretch",
+            disabled="last_scanner_results" not in st.session_state,
+        )
+    if not databases:
+        st.info("No local asset databases were detected.")
+        return
+    if clear_scan:
+        for key in (
+            "last_scanner_results", "last_scanner_summary",
+            "last_scanner_settings", "last_scan_timestamp",
+            "scanner_frame", "scanner_errors",
+        ):
+            st.session_state.pop(key, None)
+        st.rerun()
+
+    if run_scan:
+        progress = st.empty()
+        started = time.perf_counter()
+
+        def update_progress(
+            market_index: int,
+            market_count: int,
+            market: str,
+            timeframe: str,
+            reused: int,
+        ) -> None:
+            progress.info(
+                f"Scanning {market_index} / {market_count} markets...\n\n"
+                f"Current: {market} | {timeframe}\n\n"
+                f"Elapsed time: {time.perf_counter() - started:.1f}s | "
+                f"Cached datasets reused: {reused}"
+            )
+
+        frame, errors = scan_global_markets(
+            scan_databases,
+            atr_multiplier,
+            atr_period,
+            quality_threshold,
+            risk_policy,
+            friction,
+            current_open_risk,
+            realized_daily_loss,
+            evaluate_risk,
+            timeframes=selected_timeframes,
+            candidate_limit=candidate_limit,
+            progress_callback=update_progress,
+            dataset_loader=dataset_loader,
+            timeframe_resampler=timeframe_resampler,
+        )
+        progress.success(
+            f"Scan complete in {time.perf_counter() - started:.1f} seconds."
+        )
+        save_scanner_results(
+            st.session_state,
+            frame,
+            errors,
+            scan_settings,
+            pd.Timestamp.now(tz="Asia/Kolkata"),
+        )
+
+    frame = st.session_state.get("last_scanner_results")
+    errors = st.session_state.get("scanner_errors", ())
+    if frame is None:
+        st.info("Run the scanner to calculate the current opportunity list.")
+        return
+    timestamp = st.session_state.get("last_scan_timestamp")
+    if timestamp:
+        st.caption(
+            f"Showing cached scan from {pd.Timestamp(timestamp).strftime('%H:%M:%S')}. "
+            "Click Run market scan to refresh."
+        )
+    if frame.empty:
+        st.warning("No setups were found with the selected settings.")
+    else:
+        counts = st.session_state.get(
+            "last_scanner_summary",
+            frame["Trade Decision"].value_counts().to_dict(),
+        )
+        metrics = st.columns(4)
+        for column, label, value in zip(
+            metrics,
+            ("Trade ready", "Blocked", "Watch", "No trade"),
+            ("TRADE READY", "BLOCKED", "WATCH", "NO TRADE"),
+        ):
+            column.metric(label, int(counts.get(value, 0)))
+        widths = [1.2, 1.3, 0.6, 0.8, 1.4, 0.6, 0.7, 0.35]
+        labels = ("Decision", "Market", "Frame", "Pattern", "Wave", "Score", "R/R", "")
+        for column, label in zip(st.columns(widths), labels):
+            column.markdown(f"**{label}**")
+        for row_index, (_, row) in enumerate(frame.iterrows()):
+            columns = st.columns(widths)
+            values = (
+                row["Trade Decision"], row["Market"], row["Timeframe"],
+                row["Pattern"], row["Current Wave"],
+                f"{float(row['Setup Quality Score']):.1f}", row["Risk/Reward"],
+            )
+            for column, value in zip(columns[:7], values):
+                column.write(value)
+            inspect_key = scanner_inspect_button_key(row, row_index)
+            if columns[7].button(
+                "▶", key=inspect_key,
+                help="Open this exact setup in Single Chart Terminal",
+            ):
+                store_scanner_setup(st.session_state, row)
+                st.rerun()
+        st.caption(
+            f"{len(frame)} setups | setup-quality threshold "
+            f"{quality_threshold:.1f} | sorted by decision and score"
         )
     if errors:
         with st.expander(f"Skipped inputs ({len(errors)})", expanded=False):
@@ -2844,10 +3543,46 @@ def main() -> None:
         initial_sidebar_state="collapsed",
     )
     _inject_terminal_css(st)
-    terminal_tab, scanner_tab = st.tabs(("Single Chart Terminal", "Global Market Scanner"))
-    with terminal_tab:
+    inspect_candidate = st.query_params.get("inspect_candidate")
+    if inspect_candidate:
+        scanner_frame = st.session_state.get("scanner_frame")
+        matching_row = None
+        if isinstance(scanner_frame, pd.DataFrame) and not scanner_frame.empty:
+            matches = scanner_frame[
+                scanner_frame["Candidate Key"].astype(str)
+                == str(inspect_candidate)
+            ]
+            if not matches.empty:
+                matching_row = matches.iloc[0]
+        if matching_row is not None:
+            store_scanner_setup(st.session_state, matching_row)
+        else:
+            st.session_state["navigation_notice"] = (
+                "This scanner setup is no longer available. "
+                "Re-run the scanner and try again."
+            )
+        del st.query_params["inspect_candidate"]
+    requested_tab = st.session_state.pop("requested_active_tab", None)
+    if requested_tab in {"single_chart", "scanner"}:
+        st.session_state["active_tab"] = requested_tab
+    active_tab = st.radio(
+        "Terminal view",
+        ("single_chart", "scanner"),
+        format_func=lambda value: (
+            "Single Chart Terminal"
+            if value == "single_chart"
+            else "Global Market Scanner"
+        ),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="active_tab",
+    )
+    navigation_notice = st.session_state.pop("navigation_notice", None)
+    if navigation_notice:
+        st.toast(str(navigation_notice), icon="⚠️")
+    if active_tab == "single_chart":
         _render_single_chart()
-    with scanner_tab:
+    else:
         _render_global_scanner()
 
 

@@ -1,0 +1,177 @@
+[
+  {
+    "database_name": "NIFTY_50.db",
+    "display_name": "NIFTY 50",
+    "exchange_segment": "NSE_INDEX",
+    "trading_symbol": "NIFTY",
+    "instrument_key": null
+  },
+  {
+    "database_name": "NIFTY_BANK.db",
+    "display_name": "NIFTY Bank",
+    "exchange_segment": "NSE_INDEX",
+    "trading_symbol": "BANKNIFTY",
+    "instrument_key": null
+  },
+  {
+    "database_name": "RELIANCE.db",
+    "display_name": "Reliance Industries",
+    "exchange_segment": "NSE_EQ",
+    "trading_symbol": "RELIANCE",
+    "instrument_key": null
+  },
+  {
+    "database_name": "TCS.db",
+    "display_name": "Tata Consultancy Services",
+    "exchange_segment": "NSE_EQ",
+    "trading_symbol": "TCS",
+    "instrument_key": null
+  },
+  {
+    "database_name": "HDFC_BANK.db",
+    "display_name": "HDFC Bank",
+    "exchange_segment": "NSE_EQ",
+    "trading_symbol": "HDFCBANK",
+    "instrument_key": null
+  },
+  {
+    "database_name": "ICICI_BANK.db",
+    "display_name": "ICICI Bank",
+    "exchange_segment": "NSE_EQ",
+    "trading_symbol": "ICICIBANK",
+    "instrument_key": null
+  },
+  {
+    "database_name": "INFOSYS.db",
+    "display_name": "Infosys",
+    "exchange_segment": "NSE_EQ",
+    "trading_symbol": "INFY",
+    "instrument_key": null
+  },
+  {
+    "database_name": "SBI.db",
+    "display_name": "State Bank of India",
+    "exchange_segment": "NSE_EQ",
+    "trading_symbol": "SBIN",
+    "instrument_key": null
+  },
+  {
+    "database_name": "BHARTI_AIRTEL.db",
+    "display_name": "Bharti Airtel",
+    "exchange_segment": "NSE_EQ",
+    "trading_symbol": "BHARTIARTL",
+    "instrument_key": null
+  },
+  {
+    "database_name": "LARSEN_TOUBRO.db",
+    "display_name": "Larsen & Toubro",
+    "exchange_segment": "NSE_EQ",
+    "trading_symbol": "LT",
+    "instrument_key": null
+  },
+  {
+    "database_name": "BTC_USD.db",
+    "display_name": "Bitcoin / US Dollar",
+    "exchange_segment": "GLOBAL",
+    "trading_symbol": "BTCUSD",
+    "instrument_key": null
+  },
+  {
+    "database_name": "ETH_USD.db",
+    "display_name": "Ether / US Dollar",
+    "exchange_segment": "GLOBAL",
+    "trading_symbol": "ETHUSD",
+    "instrument_key": null
+  },
+  {
+    "database_name": "SOL_USD.db",
+    "display_name": "Solana / US Dollar",
+    "exchange_segment": "GLOBAL",
+    "trading_symbol": "SOLUSD",
+    "instrument_key": null
+  },
+  {
+    "database_name": "BNB_USD.db",
+    "display_name": "BNB / US Dollar",
+    "exchange_segment": "GLOBAL",
+    "trading_symbol": "BNBUSD",
+    "instrument_key": null
+  },
+  {
+    "database_name": "XRP_USD.db",
+    "display_name": "XRP / US Dollar",
+    "exchange_segment": "GLOBAL",
+    "trading_symbol": "XRPUSD",
+    "instrument_key": null
+  },
+  {
+    "database_name": "SP500.db",
+    "display_name": "S&P 500",
+    "exchange_segment": "GLOBAL",
+    "trading_symbol": "SPX",
+    "instrument_key": null
+  },
+  {
+    "database_name": "NASDAQ_100.db",
+    "display_name": "Nasdaq 100",
+    "exchange_segment": "GLOBAL",
+    "trading_symbol": "NDX",
+    "instrument_key": null
+  },
+  {
+    "database_name": "DOW_JONES.db",
+    "display_name": "Dow Jones",
+    "exchange_segment": "GLOBAL",
+    "trading_symbol": "DJI",
+    "instrument_key": null
+  },
+  {
+    "database_name": "RUSSELL_2000.db",
+    "display_name": "Russell 2000",
+    "exchange_segment": "GLOBAL",
+    "trading_symbol": "RUT",
+    "instrument_key": null
+  },
+  {
+    "database_name": "GOLD.db",
+    "display_name": "Gold",
+    "exchange_segment": "MCX_FO",
+    "trading_symbol": "GOLD",
+    "instrument_key": null
+  },
+  {
+    "database_name": "SILVER.db",
+    "display_name": "Silver",
+    "exchange_segment": "MCX_FO",
+    "trading_symbol": "SILVER",
+    "instrument_key": null
+  },
+  {
+    "database_name": "WTI_CRUDE.db",
+    "display_name": "Crude Oil",
+    "exchange_segment": "MCX_FO",
+    "trading_symbol": "CRUDEOIL",
+    "instrument_key": null
+  },
+  {
+    "database_name": "EUR_USD.db",
+    "display_name": "EUR / USD",
+    "exchange_segment": "GLOBAL",
+    "trading_symbol": "EURUSD",
+    "instrument_key": null
+  },
+  {
+    "database_name": "GBP_USD.db",
+    "display_name": "GBP / USD",
+    "exchange_segment": "GLOBAL",
+    "trading_symbol": "GBPUSD",
+    "instrument_key": null
+  },
+  {
+    "database_name": "USD_INR.db",
+    "display_name": "USD / INR",
+    "exchange_segment": "NCD_FO",
+    "trading_symbol": "USDINR",
+    "instrument_key": null
+  }
+]

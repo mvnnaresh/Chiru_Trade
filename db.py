@@ -223,10 +223,25 @@ def resample_ohlcv(
     if normalized_timeframe not in TIMEFRAMES:
         supported = "', '".join(TIMEFRAMES)
         raise ValueError(f"timeframe must be one of '{supported}'")
-    spec = TIMEFRAMES[normalized_timeframe]
     m5 = load_m5(database, start=start, end=end)
+    return resample_m5(m5, normalized_timeframe, database, complete_only=complete_only)
+
+
+def resample_m5(
+    m5: pd.DataFrame,
+    timeframe: str,
+    database: str | Path,
+    *,
+    complete_only: bool = True,
+) -> pd.DataFrame:
+    """Resample an already-loaded M5 frame without reopening SQLite."""
+    normalized_timeframe = timeframe.upper()
+    if normalized_timeframe not in TIMEFRAMES:
+        supported = "', '".join(TIMEFRAMES)
+        raise ValueError(f"timeframe must be one of '{supported}'")
+    spec = TIMEFRAMES[normalized_timeframe]
     if m5.empty:
-        return m5
+        return m5.copy()
 
     profile = get_asset_profile(database) if spec.kind == "calendar" else None
     source = m5.tz_convert(profile.timezone) if profile is not None else m5
