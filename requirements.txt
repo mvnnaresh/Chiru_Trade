@@ -1,8 +1,7 @@
 pandas>=2.2,<3
-pytest>=8,<9
-streamlit>=1.35,<2
+streamlit>=1.58,<1.60
 streamlit-lightweight-charts==0.7.20
 yfinance>=0.2.54,<1
-protobuf>=5,<7
+protobuf>=7.35.1,<8
 websocket-client>=1.8,<2
-grpcio-tools>=1.82,<2
+requests>=2.31,<3
