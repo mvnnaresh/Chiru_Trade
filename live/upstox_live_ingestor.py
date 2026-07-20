@@ -27,6 +27,7 @@ from live.instrument_resolver import (
     UpstoxInstrumentMap,
     resolve_instruments,
 )
+from live.token_loader import load_upstox_access_token
 from providers.upstox_provider import UpstoxProvider
 
 
@@ -87,10 +88,11 @@ def main(argv: list[str] | None = None) -> int:
         print("Dry run complete; no WebSocket connection was attempted.")
         return 0
 
-    token = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
+    token = load_upstox_access_token(root=args.root)
     if not token:
         print(
-            "UPSTOX_ACCESS_TOKEN is missing. Local SQLite/Yahoo modes remain available.",
+            "UPSTOX_ACCESS_TOKEN is missing in env and .streamlit/secrets.toml. "
+            "Local SQLite/Yahoo modes remain available.",
             file=sys.stderr,
         )
         return 2

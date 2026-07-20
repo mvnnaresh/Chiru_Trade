@@ -9,8 +9,15 @@ Upstox Live is intended for Indian production market data. Yahoo remains a
 test-refresh feed, and Local SQLite mode remains available without credentials.
 
 1. Create an Upstox developer application.
-2. Configure credentials in the environment (the current preparation stage
-   requires only the access token at runtime):
+2. Configure credentials. For the current preparation stage, only the access
+   token is required at runtime. You can either place it in
+   `.streamlit/secrets.toml`:
+
+   ```toml
+   UPSTOX_ACCESS_TOKEN="..."
+   ```
+
+   or set the environment variables below:
 
    ```text
    UPSTOX_API_KEY=...
@@ -19,10 +26,10 @@ test-refresh feed, and Local SQLite mode remains available without credentials.
    UPSTOX_ACCESS_TOKEN=...
    ```
 
-3. Download/cache the official Upstox JSON instrument master as
-   `upstox_instruments_cache.json`, then verify mappings without connecting:
+3. Bootstrap the public Upstox assets and verify mappings without connecting:
 
    ```powershell
+   python live/upstox_bootstrap.py
    python live/upstox_live_ingestor.py --dry-run
    ```
 

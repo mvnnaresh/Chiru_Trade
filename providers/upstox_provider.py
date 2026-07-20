@@ -7,6 +7,7 @@ import logging
 import uuid
 from collections.abc import Iterable
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import pandas as pd
@@ -15,6 +16,17 @@ from providers.base import MarketDataProvider, TickCallback
 
 LOGGER = logging.getLogger(__name__)
 AUTHORIZE_URL = "https://api.upstox.com/v3/feed/market-data-feed/authorize"
+DEFAULT_HEADERS = {
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/138.0.0.0 Safari/537.36"
+    ),
+}
 
 
 class UpstoxProvider(MarketDataProvider):
@@ -42,15 +54,7 @@ class UpstoxProvider(MarketDataProvider):
             raise RuntimeError(
                 "Install websocket-client to use Upstox Live"
             ) from error
-        request = Request(
-            AUTHORIZE_URL,
-            headers={
-                "Authorization": f"Bearer {self.access_token}",
-                "Accept": "application/json",
-            },
-        )
-        with urlopen(request, timeout=20) as response:
-            payload = json.load(response)
+        payload = authorize_market_feed(self.access_token)
         uri = payload.get("data", {}).get("authorized_redirect_uri")
         if not uri:
             raise RuntimeError("Upstox did not return an authorized WebSocket URL")
@@ -92,12 +96,20 @@ def decode_market_feed(message: bytes) -> tuple[dict[str, Any], ...]:
     """Decode official V3 Protobuf bytes into provider-neutral tick dictionaries."""
     try:
         from google.protobuf.json_format import MessageToDict
-        import MarketDataFeedV3_pb2 as feed_pb2
     except ImportError as error:
         raise RuntimeError(
-            "Upstox Protobuf bindings are missing; generate "
-            "MarketDataFeedV3_pb2.py from the official V3 proto"
+            "google.protobuf is required for Upstox live decoding"
         ) from error
+    try:
+        import MarketDataFeedV3_pb2 as feed_pb2
+    except ImportError:
+        try:
+            import MarketDataFeed_pb2 as feed_pb2
+        except ImportError as error:
+            raise RuntimeError(
+                "Upstox Protobuf bindings are missing; generate "
+                "MarketDataFeedV3_pb2.py or MarketDataFeed_pb2.py from the official V3 proto"
+            ) from error
 
     response = feed_pb2.FeedResponse()
     response.ParseFromString(message)
@@ -108,7 +120,11 @@ def decode_market_feed(message: bytes) -> tuple[dict[str, Any], ...]:
         ltp = ltpc.get("ltp")
         if ltp is None:
             continue
-        timestamp = ltpc.get("ltt") or payload.get("current_ts")
+        timestamp = (
+            ltpc.get("ltt")
+            or payload.get("currentTs")
+            or payload.get("current_ts")
+        )
         events.append(
             {
                 "instrument_key": instrument_key,
@@ -139,6 +155,45 @@ def _find_mapping(value: Any, key: str) -> dict[str, Any] | None:
             if result is not None:
                 return result
     return None
+
+
+def authorize_market_feed(access_token: str) -> dict[str, Any]:
+    """Authorize the market-data feed with a browser-like HTTP client."""
+    token = access_token.strip()
+    if not token:
+        raise ValueError("UPSTOX_ACCESS_TOKEN is required")
+    headers = {
+        **DEFAULT_HEADERS,
+        "Authorization": f"Bearer {token}",
+    }
+    try:
+        import requests
+    except ImportError:
+        request = Request(AUTHORIZE_URL, headers=headers)
+        with urlopen(request, timeout=20) as response:
+            return json.load(response)
+
+    response = requests.get(
+        AUTHORIZE_URL,
+        headers=headers,
+        timeout=20,
+        allow_redirects=True,
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as error:
+        raise RuntimeError(_format_http_error(response.status_code, response.text)) from error
+    try:
+        return response.json()
+    except ValueError as error:
+        raise RuntimeError("Upstox authorize endpoint returned non-JSON content") from error
+
+
+def _format_http_error(status_code: int, body: str) -> str:
+    body = body.strip()
+    if not body:
+        return f"HTTP {status_code}"
+    return f"HTTP {status_code}: {body}"
 
 
 def _find_numeric(value: Any, keys: tuple[str, ...]) -> float | None:

@@ -1,14 +1,17 @@
 import json
 import sqlite3
+from datetime import date
 
 import pandas as pd
 
 from live.candle_builder import M5CandleBuilder
+from live.upstox_backfill import candles_to_m5_frame, chunk_date_range
 from live.instrument_resolver import (
     DEFAULT_UPSTOX_UNIVERSE,
     UpstoxInstrumentMap,
     resolve_instruments,
 )
+from live.token_loader import load_upstox_access_token
 from live.upstox_live_ingestor import main, select_universe
 
 
@@ -120,3 +123,66 @@ def test_symbol_subset_does_not_require_manual_subscription():
         "HDFC_BANK.db",
         "RELIANCE.db",
     }
+
+
+def test_token_loader_reads_streamlit_secrets(tmp_path, monkeypatch):
+    monkeypatch.delenv("UPSTOX_ACCESS_TOKEN", raising=False)
+    secrets_dir = tmp_path / ".streamlit"
+    secrets_dir.mkdir()
+    (secrets_dir / "secrets.toml").write_text(
+        'UPSTOX_ACCESS_TOKEN = "secret-token"\n',
+        encoding="utf-8",
+    )
+
+    assert load_upstox_access_token(root=tmp_path) == "secret-token"
+
+
+def test_chunk_date_range_splits_six_month_backfill_into_safe_windows():
+    windows = chunk_date_range(date(2026, 1, 1), date(2026, 2, 15), chunk_days=28)
+
+    assert windows == (
+        (date(2026, 1, 1), date(2026, 1, 28)),
+        (date(2026, 1, 29), date(2026, 2, 15)),
+    )
+
+
+def test_candles_to_m5_frame_normalizes_and_sorts(monkeypatch):
+    payload = {
+        "data": {
+            "candles": [
+                ["2026-07-20T09:20:00+05:30", 101, 103, 100, 102, 12, 0],
+                ["2026-07-20T09:15:00+05:30", 100, 102, 99, 101, 10, 0],
+            ]
+        }
+    }
+
+    frame = candles_to_m5_frame(payload)
+
+    assert list(frame.columns) == ["open", "high", "low", "close", "volume"]
+    assert list(frame.index) == [
+        pd.Timestamp("2026-07-20T03:45:00Z"),
+        pd.Timestamp("2026-07-20T03:50:00Z"),
+    ]
+    assert frame.iloc[0]["close"] == 101.0
+    assert frame.iloc[1]["volume"] == 12.0
+
+
+def test_candles_to_m5_frame_drops_forming_bucket(monkeypatch):
+    class FrozenTimestamp(pd.Timestamp):
+        @classmethod
+        def now(cls, tz=None):
+            return pd.Timestamp("2026-07-20T10:32:00Z")
+
+    monkeypatch.setattr(pd, "Timestamp", FrozenTimestamp)
+    payload = {
+        "data": {
+            "candles": [
+                ["2026-07-20T10:30:00+00:00", 101, 103, 100, 102, 12, 0],
+                ["2026-07-20T10:25:00+00:00", 100, 102, 99, 101, 10, 0],
+            ]
+        }
+    }
+
+    frame = candles_to_m5_frame(payload, drop_forming=True)
+
+    assert list(frame.index) == [pd.Timestamp("2026-07-20T10:25:00Z")]

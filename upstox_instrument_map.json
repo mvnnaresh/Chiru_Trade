@@ -4,70 +4,70 @@
     "display_name": "NIFTY 50",
     "exchange_segment": "NSE_INDEX",
     "trading_symbol": "NIFTY",
-    "instrument_key": null
+    "instrument_key": "NSE_INDEX|Nifty 50"
   },
   {
     "database_name": "NIFTY_BANK.db",
     "display_name": "NIFTY Bank",
     "exchange_segment": "NSE_INDEX",
     "trading_symbol": "BANKNIFTY",
-    "instrument_key": null
+    "instrument_key": "NSE_INDEX|Nifty Bank"
   },
   {
     "database_name": "RELIANCE.db",
     "display_name": "Reliance Industries",
     "exchange_segment": "NSE_EQ",
     "trading_symbol": "RELIANCE",
-    "instrument_key": null
+    "instrument_key": "NSE_EQ|INE002A01018"
   },
   {
     "database_name": "TCS.db",
     "display_name": "Tata Consultancy Services",
     "exchange_segment": "NSE_EQ",
     "trading_symbol": "TCS",
-    "instrument_key": null
+    "instrument_key": "NSE_EQ|INE467B01029"
   },
   {
     "database_name": "HDFC_BANK.db",
     "display_name": "HDFC Bank",
     "exchange_segment": "NSE_EQ",
     "trading_symbol": "HDFCBANK",
-    "instrument_key": null
+    "instrument_key": "NSE_EQ|INE040A01034"
   },
   {
     "database_name": "ICICI_BANK.db",
     "display_name": "ICICI Bank",
     "exchange_segment": "NSE_EQ",
     "trading_symbol": "ICICIBANK",
-    "instrument_key": null
+    "instrument_key": "NSE_EQ|INE090A01021"
   },
   {
     "database_name": "INFOSYS.db",
     "display_name": "Infosys",
     "exchange_segment": "NSE_EQ",
     "trading_symbol": "INFY",
-    "instrument_key": null
+    "instrument_key": "NSE_EQ|INE009A01021"
   },
   {
     "database_name": "SBI.db",
     "display_name": "State Bank of India",
     "exchange_segment": "NSE_EQ",
     "trading_symbol": "SBIN",
-    "instrument_key": null
+    "instrument_key": "NSE_EQ|INE062A01020"
   },
   {
     "database_name": "BHARTI_AIRTEL.db",
     "display_name": "Bharti Airtel",
     "exchange_segment": "NSE_EQ",
     "trading_symbol": "BHARTIARTL",
-    "instrument_key": null
+    "instrument_key": "NSE_EQ|INE397D01024"
   },
   {
     "database_name": "LARSEN_TOUBRO.db",
     "display_name": "Larsen & Toubro",
     "exchange_segment": "NSE_EQ",
     "trading_symbol": "LT",
-    "instrument_key": null
+    "instrument_key": "NSE_EQ|INE018A01030"
   },
   {
     "database_name": "BTC_USD.db",

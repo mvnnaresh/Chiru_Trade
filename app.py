@@ -29,8 +29,10 @@ from engine import (
     find_provisional_candidates,
     select_active_primary,
 )
-from market_data import append_latest_m5, resolve_market_symbol
 from live.instrument_resolver import DEFAULT_UPSTOX_UNIVERSE, resolve_instruments
+from live.upstox_backfill import backfill_market
+from live.token_loader import load_upstox_access_token
+from market_data import append_latest_m5, resolve_market_symbol
 from pivots import Pivot, PivotState, extract_pivot_state
 from scoring import ConfidenceScore, calculate_rsi, score_candidates
 from risk import RiskPolicy
@@ -1489,6 +1491,60 @@ def _inject_terminal_css(st) -> None:
             background: #10141c; border: 1px solid #202632;
             border-radius: 8px; padding: .7rem .8rem; margin-bottom: .55rem;
         }
+        .desktop-only { display: block; }
+        .mobile-only { display: none; }
+        .scanner-mobile-card {
+            background: #10141c;
+            border: 1px solid #202632;
+            border-radius: 12px;
+            padding: .9rem .95rem;
+            margin-bottom: .8rem;
+        }
+        .scanner-mobile-topline {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: .75rem;
+            margin-bottom: .55rem;
+        }
+        .scanner-mobile-decision {
+            font-size: .9rem;
+            font-weight: 800;
+            letter-spacing: .03em;
+        }
+        .scanner-mobile-market {
+            font-size: 1rem;
+            font-weight: 700;
+            color: #f2f5f8;
+        }
+        .scanner-mobile-meta {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: .6rem .9rem;
+            margin-top: .5rem;
+        }
+        .scanner-mobile-field {
+            min-width: 0;
+        }
+        .scanner-mobile-label {
+            color: #7f8a9a;
+            font-size: .63rem;
+            text-transform: uppercase;
+            letter-spacing: .08em;
+            margin-bottom: .18rem;
+        }
+        .scanner-mobile-value {
+            color: #f2f5f8;
+            font-size: .95rem;
+            font-weight: 600;
+            line-height: 1.25;
+            word-break: break-word;
+        }
+        .scanner-mobile-reason {
+            margin-top: .7rem;
+            padding-top: .65rem;
+            border-top: 1px solid #202632;
+        }
         .terminal-kicker {
             color: #7f8a9a; font-size: .65rem; text-transform: uppercase;
             letter-spacing: .09em;
@@ -1520,6 +1576,16 @@ def _inject_terminal_css(st) -> None:
         iframe { border-radius: 8px; }
         [data-testid="stDataFrame"] {
             border: 1px solid #202632; border-radius: 8px;
+        }
+        @media (max-width: 768px) {
+            .stMainBlockContainer {
+                padding: .75rem .75rem 1.35rem;
+            }
+            .desktop-only { display: none !important; }
+            .mobile-only { display: block !important; }
+            .scanner-mobile-meta {
+                grid-template-columns: 1fr;
+            }
         }
         </style>
         """,
@@ -1697,7 +1763,9 @@ def _render_single_chart_fragmented() -> None:
             ),
             key="data_provider",
         )
-        live_mode = data_provider == "Yahoo Test Refresh"
+        yahoo_live_mode = data_provider == "Yahoo Test Refresh"
+        upstox_live_mode = data_provider == "Upstox Live"
+        live_mode = yahoo_live_mode or upstox_live_mode
     with universe_col:
         candidate_scope = st.selectbox(
             "Candidate Scope",
@@ -1793,13 +1861,8 @@ def _render_single_chart_fragmented() -> None:
         st.caption(
             f"Resolved setup-quality threshold: {resolved_setup_quality_threshold:.1f}"
         )
-        upstox_token = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
+        upstox_token = load_upstox_access_token()
         if data_provider == "Upstox Live":
-            if not upstox_token:
-                try:
-                    upstox_token = str(st.secrets.get("UPSTOX_ACCESS_TOKEN", "")).strip()
-                except Exception:
-                    upstox_token = ""
             if not upstox_token:
                 upstox_token = st.text_input(
                     "Upstox Access Token",
@@ -1808,13 +1871,42 @@ def _render_single_chart_fragmented() -> None:
                     help="Held only in this Streamlit session; credentials are never written.",
                 ).strip()
             resolved_upstox, unresolved_upstox = resolve_instruments()
+            selected_upstox_mapping = (
+                next(
+                    (
+                        item
+                        for item in resolved_upstox
+                        if selected_database is not None
+                        and item.database_name == selected_database.name
+                    ),
+                    None,
+                )
+                if selected_database is not None
+                else None
+            )
             st.caption(
                 f"Selected universe: {len(DEFAULT_UPSTOX_UNIVERSE)} | "
                 f"Resolved: {len(resolved_upstox)}"
             )
-            if unresolved_upstox:
+            if selected_database is not None and selected_upstox_mapping is None:
+                unresolved_selected = next(
+                    (
+                        item
+                        for item in unresolved_upstox
+                        if item.database_name == selected_database.name
+                    ),
+                    None,
+                )
+                if unresolved_selected is not None:
+                    st.warning(
+                        "Selected market is not resolved for Upstox: "
+                        f"{unresolved_selected.database_name} -> "
+                        f"{unresolved_selected.exchange_segment}/"
+                        f"{unresolved_selected.trading_symbol}"
+                    )
+            elif unresolved_upstox:
                 st.warning(
-                    "Unresolved instruments: "
+                    "Some optional universe symbols are unresolved: "
                     + ", ".join(item.database_name for item in unresolved_upstox)
                 )
             status_file = Path("upstox_live_status.json")
@@ -1830,9 +1922,38 @@ def _render_single_chart_fragmented() -> None:
                 f"Last completed M5: "
                 f"{status_payload.get('last_completed_m5') or 'n/a'}"
             )
+            backfill_disabled = not bool(upstox_token) or selected_upstox_mapping is None
+            if st.button(
+                "Backfill last 6 months",
+                key="upstox_backfill_6m",
+                disabled=backfill_disabled,
+                help=(
+                    "Load roughly 6 months of completed 5-minute history from Upstox "
+                    "into the selected market database."
+                ),
+            ):
+                try:
+                    with st.spinner(
+                        f"Backfilling 6 months for {selected_database.name} from Upstox..."
+                    ):
+                        result = backfill_market(
+                            selected_upstox_mapping,
+                            token=upstox_token,
+                            root=Path("."),
+                            months=6,
+                            include_today=True,
+                        )
+                    st.success(
+                        f"Backfill complete: {result.database_name} | "
+                        f"+{result.inserted_rows} rows | "
+                        f"{result.start or 'n/a'} -> {result.end or 'n/a'}"
+                    )
+                except Exception as error:
+                    st.error(f"Upstox backfill failed: {error}")
             st.caption(
-                "Run `python live/upstox_live_ingestor.py --universe default` "
-                "in a separate terminal. OAuth refresh/login remains TODO."
+                "Bootstrap once with `python live/upstox_bootstrap.py`, then run "
+                "`python live/upstox_live_ingestor.py --universe default` in a "
+                "separate terminal. OAuth refresh/login remains TODO."
             )
 
     risk_policy: RiskPolicy | None = None
@@ -1888,7 +2009,7 @@ def _render_single_chart_fragmented() -> None:
         st.info("Place a .db, .sqlite, or .sqlite3 asset database beside app.py.")
         return
 
-    effective_live_mode = bool(live_mode and live_supported)
+    effective_live_mode = bool(live_mode and (live_supported or upstox_live_mode))
     refresh_key = st.session_state.get("live_refresh_interval", live_interval_default)
     refresh_seconds = LIVE_REFRESH_SECONDS.get(refresh_key, LIVE_REFRESH_SECONDS["30s"])
 
@@ -1896,7 +2017,8 @@ def _render_single_chart_fragmented() -> None:
     def _render_terminal_body() -> None:
         live_refresh_ok: bool | None = None
         live_state: LiveRefreshState | None = None
-        if effective_live_mode:
+        upstox_live_active = data_provider == "Upstox Live"
+        if effective_live_mode and data_provider == "Yahoo Test Refresh":
             try:
                 live_state = refresh_live_database_state(selected_database)
                 st.session_state["live_poll_count"] = int(
@@ -1916,6 +2038,29 @@ def _render_single_chart_fragmented() -> None:
                 ) + 1
                 st.session_state["live_last_checked_at"] = pd.Timestamp.now(tz="UTC")
                 st.session_state["live_rows_added"] = 0
+        elif effective_live_mode and upstox_live_active:
+            st.session_state["live_poll_count"] = int(
+                st.session_state.get("live_poll_count", 0)
+            ) + 1
+            st.session_state["live_last_checked_at"] = pd.Timestamp.now(tz="UTC")
+            st.session_state["live_rows_added"] = 0
+            last_completed_m5 = status_payload.get("last_completed_m5")
+            if last_completed_m5:
+                try:
+                    st.session_state["live_last_completed_bar"] = pd.Timestamp(
+                        last_completed_m5
+                    )
+                except Exception:
+                    pass
+            live_refresh_ok = str(
+                status_payload.get("state", "")
+            ) == "UPSTOX LIVE CONNECTED"
+            st.caption(
+                "Upstox live | "
+                f"state={status_payload.get('state', 'not started')} | "
+                f"last tick={status_payload.get('last_tick_time') or 'n/a'} | "
+                f"last completed M5={status_payload.get('last_completed_m5') or 'n/a'}"
+            )
 
         status_label, status_color = system_status(
             live_enabled=effective_live_mode,
@@ -1931,9 +2076,9 @@ def _render_single_chart_fragmented() -> None:
         elif data_provider == "Upstox Live":
             if not upstox_token:
                 status_label, status_color = "UPSTOX TOKEN MISSING", "#F05D68"
-            elif unresolved_upstox:
+            elif selected_database is not None and selected_upstox_mapping is None:
                 status_label, status_color = (
-                    "UPSTOX INSTRUMENTS UNRESOLVED",
+                    "UPSTOX MARKET UNRESOLVED",
                     "#F0B90B",
                 )
             else:
@@ -1988,6 +2133,18 @@ def _render_single_chart_fragmented() -> None:
                 f"<div><div class='terminal-kicker'>Last new bar</div><div class='terminal-value'>{new_bar_text}</div></div>"
                 f"<div><div class='terminal-kicker'>Rows added</div><div class='terminal-value'>{rows_added:+d}</div></div>"
                 "</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                """
+                <div class='terminal-panel' style='padding:.55rem .8rem'>
+                    <div style='color:#F4F7FA;font-size:.8rem'>
+                        <strong>Live behavior:</strong> ticks stream continuously, but the Elliott-wave engine
+                        recomputes only when a new <strong>completed M5 candle</strong> is written to the
+                        canonical SQLite feed.
+                    </div>
+                </div>
+                """,
                 unsafe_allow_html=True,
             )
 
@@ -3308,7 +3465,7 @@ def _render_global_scanner() -> None:
         st.session_state.get("active_realized_daily_loss", 0.0)
     )
 
-    control_cols = st.columns([1.2, 1.8, 0.8, 1.0])
+    control_cols = st.columns([1.1, 1.55, 0.7, 0.95, 1.0])
     with control_cols[0]:
         market_scope = st.selectbox(
             "Markets to scan", ("All", "Indian only", "Selected watchlist")
@@ -3328,6 +3485,12 @@ def _render_global_scanner() -> None:
             "Evaluate risk in scanner",
             value=False,
             help="Optional. Uses Risk Settings and takes more time.",
+        )
+    with control_cols[4]:
+        scanner_layout = st.selectbox(
+            "Scanner layout",
+            ("Desktop table", "Mobile cards"),
+            help="Use Mobile cards on phones or whenever the scanner table feels crowded.",
         )
 
     indian_names = {
@@ -3504,26 +3667,90 @@ def _render_global_scanner() -> None:
             ("TRADE READY", "BLOCKED", "WATCH", "NO TRADE"),
         ):
             column.metric(label, int(counts.get(value, 0)))
-        widths = [1.2, 1.3, 0.6, 0.8, 1.4, 0.6, 0.7, 0.35]
-        labels = ("Decision", "Market", "Frame", "Pattern", "Wave", "Score", "R/R", "")
-        for column, label in zip(st.columns(widths), labels):
-            column.markdown(f"**{label}**")
-        for row_index, (_, row) in enumerate(frame.iterrows()):
-            columns = st.columns(widths)
-            values = (
-                row["Trade Decision"], row["Market"], row["Timeframe"],
-                row["Pattern"], row["Current Wave"],
-                f"{float(row['Setup Quality Score']):.1f}", row["Risk/Reward"],
-            )
-            for column, value in zip(columns[:7], values):
-                column.write(value)
-            inspect_key = scanner_inspect_button_key(row, row_index)
-            if columns[7].button(
-                "▶", key=inspect_key,
-                help="Open this exact setup in Single Chart Terminal",
-            ):
-                store_scanner_setup(st.session_state, row)
-                st.rerun()
+
+        if scanner_layout == "Desktop table":
+            widths = [1.2, 1.3, 0.6, 0.8, 1.4, 0.6, 0.7, 0.35]
+            labels = ("Decision", "Market", "Frame", "Pattern", "Wave", "Score", "R/R", "")
+            for column, label in zip(st.columns(widths), labels):
+                column.markdown(f"**{label}**")
+            for row_index, (_, row) in enumerate(frame.iterrows()):
+                columns = st.columns(widths)
+                values = (
+                    row["Trade Decision"], row["Market"], row["Timeframe"],
+                    row["Pattern"], row["Current Wave"],
+                    f"{float(row['Setup Quality Score']):.1f}", row["Risk/Reward"],
+                )
+                for column, value in zip(columns[:7], values):
+                    column.write(value)
+                inspect_key = scanner_inspect_button_key(row, row_index)
+                if columns[7].button(
+                    "▶", key=inspect_key,
+                    help="Open this exact setup in Single Chart Terminal",
+                ):
+                    store_scanner_setup(st.session_state, row)
+                    st.rerun()
+        else:
+            for row_index, (_, row) in enumerate(frame.iterrows()):
+                decision = str(row["Trade Decision"])
+                decision_class = (
+                    "positive"
+                    if decision == "TRADE READY"
+                    else "negative"
+                    if decision == "BLOCKED"
+                    else ""
+                )
+                risk_reward = str(row["Risk/Reward"])
+                reason = str(row["Reason"])
+                st.markdown(
+                    f"""
+                    <div class="scanner-mobile-card">
+                        <div class="scanner-mobile-topline">
+                            <div class="scanner-mobile-market">{html.escape(str(row["Market"]))}</div>
+                            <div class="scanner-mobile-decision {decision_class}">{html.escape(decision)}</div>
+                        </div>
+                        <div class="scanner-mobile-meta">
+                            <div class="scanner-mobile-field">
+                                <div class="scanner-mobile-label">Timeframe</div>
+                                <div class="scanner-mobile-value">{html.escape(str(row["Timeframe"]))}</div>
+                            </div>
+                            <div class="scanner-mobile-field">
+                                <div class="scanner-mobile-label">Pattern</div>
+                                <div class="scanner-mobile-value">{html.escape(str(row["Pattern"]))}</div>
+                            </div>
+                            <div class="scanner-mobile-field">
+                                <div class="scanner-mobile-label">Current wave</div>
+                                <div class="scanner-mobile-value">{html.escape(str(row["Current Wave"]))}</div>
+                            </div>
+                            <div class="scanner-mobile-field">
+                                <div class="scanner-mobile-label">Score</div>
+                                <div class="scanner-mobile-value">{float(row["Setup Quality Score"]):.1f}</div>
+                            </div>
+                            <div class="scanner-mobile-field">
+                                <div class="scanner-mobile-label">R/R</div>
+                                <div class="scanner-mobile-value">{html.escape(risk_reward if risk_reward != 'Not evaluated' else 'Pending')}</div>
+                            </div>
+                            <div class="scanner-mobile-field">
+                                <div class="scanner-mobile-label">Direction</div>
+                                <div class="scanner-mobile-value">{html.escape(str(row["Direction"]))}</div>
+                            </div>
+                        </div>
+                        <div class="scanner-mobile-reason">
+                            <div class="scanner-mobile-label">Reason</div>
+                            <div class="scanner-mobile-value">{html.escape(reason)}</div>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                if st.button(
+                    "Open chart",
+                    key=f"{scanner_inspect_button_key(row, row_index)}_mobile",
+                    help="Open this exact setup in Single Chart Terminal",
+                    use_container_width=True,
+                ):
+                    store_scanner_setup(st.session_state, row)
+                    st.rerun()
+
         st.caption(
             f"{len(frame)} setups | setup-quality threshold "
             f"{quality_threshold:.1f} | sorted by decision and score"

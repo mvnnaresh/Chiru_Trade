@@ -1,1 +1,5 @@
 __pycache__/
+.tmp_pytest_app_live_note/
+.tmp_pytest_app_upstox/
+.tmp_pytest_mobile_layout_switch/
+.tmp_pytest_mobile_scanner/
